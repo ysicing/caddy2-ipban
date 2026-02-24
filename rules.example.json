@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "path": [
+        "/.env", "/.env.bak", "/.env.local",
+        "/.git/config", "/.git/HEAD",
+        "/.htaccess", "/.htpasswd",
+        "/wp-login.php", "/xmlrpc.php", "/wp-config.php",
+        "/adminer.php", "/config.php", "/config.bak",
+        "/backup.sql", "/dump.sql", "/db.sql",
+        "/shell.php", "/cmd.php", "/c99.php",
+        "/server-status", "/server-info"
+      ],
+      "path_prefix": [
+        "/.env.", "/.git/", "/.svn/",
+        "/wp-admin/", "/wp-content/uploads/",
+        "/phpmyadmin", "/pma/", "/phpMyAdmin",
+        "/cgi-bin/",
+        "/actuator/", "/debug/pprof",
+        "/etc/passwd", "/proc/self/"
+      ],
+      "path_keyword": [
+        "wp-config", "phpinfo"
+      ],
+      "user_agent_keyword": [
+        "sqlmap", "nikto", "nmap", "masscan", "zgrab",
+        "gobuster", "dirbuster", "wfuzz", "ffuf", "nuclei",
+        "acunetix", "nessus", "openvas", "burpsuite",
+        "wpscan", "xray", "censys", "shodan"
+      ]
+    },
+    {
+      "path_regex": [
+        "\\.(sql|bak|old|orig|save|swp|dist)$",
+        "\\.(tar\\.gz|zip|rar|7z)$"
+      ],
+      "user_agent_regex": [
+        "python-requests/\\d",
+        "Go-http-client"
+      ]
+    }
+  ]
+}
