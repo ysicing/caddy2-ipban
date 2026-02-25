@@ -82,8 +82,6 @@ func (s *Store) debounceSave() {
 		s.saveTimer.Stop()
 	}
 	s.saveTimer = time.AfterFunc(time.Second, func() {
-		s.mu.RLock()
-		defer s.mu.RUnlock()
 		_ = s.save()
 	})
 }
@@ -91,7 +89,6 @@ func (s *Store) debounceSave() {
 // Cleanup removes expired entries and persists the result.
 func (s *Store) Cleanup() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.saveTimer != nil {
 		s.saveTimer.Stop()
 	}
@@ -101,6 +98,8 @@ func (s *Store) Cleanup() {
 			delete(s.records, ip)
 		}
 	}
+	s.mu.Unlock()
+
 	if s.filePath != "" {
 		_ = s.save()
 	}
@@ -143,6 +142,7 @@ func (s *Store) load() error {
 }
 
 func (s *Store) save() error {
+	s.mu.RLock()
 	records := make([]*BanRecord, 0, len(s.records))
 	now := time.Now()
 	for _, r := range s.records {
@@ -151,6 +151,8 @@ func (s *Store) save() error {
 		}
 		records = append(records, r)
 	}
+	s.mu.RUnlock()
+
 	data, err := json.MarshalIndent(records, "", "  ")
 	if err != nil {
 		return err

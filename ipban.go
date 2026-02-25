@@ -173,9 +173,11 @@ func (m *IPBan) ban(ip, reason string) {
 	dur := time.Duration(m.BanDuration)
 	m.store.Ban(ip, reason, dur)
 	if m.ipset.Available() {
-		if err := m.ipset.Add(ip); err != nil {
-			m.logger.Error("ipset add failed", zap.String("ip", ip), zap.Error(err))
-		}
+		go func(ipStr string) {
+			if err := m.ipset.Add(ipStr); err != nil {
+				m.logger.Error("ipset add failed", zap.String("ip", ipStr), zap.Error(err))
+			}
+		}(ip)
 	}
 	m.logger.Info("ip banned", zap.String("ip", ip), zap.String("reason", reason))
 }
