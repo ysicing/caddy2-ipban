@@ -1,9 +1,6 @@
 package ipban
 
-import (
-	"net"
-	"os/exec"
-)
+import "os/exec"
 
 // IPSet wraps the Linux ipset command for kernel-level IP blocking.
 type IPSet struct {
@@ -28,12 +25,7 @@ func (s *IPSet) Add(ip string) error {
 	if !s.available {
 		return nil
 	}
-	// Normalize: strip port, handle IPv6 brackets
-	host := ip
-	if h, _, err := net.SplitHostPort(ip); err == nil {
-		host = h
-	}
-	return exec.Command("ipset", "add", s.name, host, "-exist").Run()
+	return exec.Command("ipset", "add", s.name, ip, "-exist").Run()
 }
 
 func (s *IPSet) init() bool {

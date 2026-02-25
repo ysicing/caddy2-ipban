@@ -35,7 +35,7 @@ Blocked requests get a random 4xx status code. Banned IPs are stored in-memory (
 - **IPBan** (`ipban.go`) — Caddy module entry point. Implements `caddyhttp.MiddlewareHandler`. Wires together RuleManager, Store, and IPSet. Registers the `ipban` Caddyfile directive.
 - **RuleManager** (`rule_manager.go`) — Manages rule lifecycle. Loads from local file and/or remote URL, merges both sources. Local file watched via fsnotify with 500ms debounce. Remote URL refreshed on interval using ETag conditional requests (`If-None-Match` / 304). Remote rules cached locally for offline startup fallback.
 - **Rules** (`rules.go`) — Rule JSON format definition (sing-box inspired), compiled rule matching, and HTTP fetch logic. Rules support: `path`, `path_prefix`, `path_keyword`, `path_regex`, `user_agent_keyword`, `user_agent_regex`, `invert`.
-- **Store** (`store.go`) — In-memory banned IP map with `sync.RWMutex`. Supports TTL-based expiry and JSON file persistence.
+- **Store** (`store.go`) — In-memory banned IP map with `sync.RWMutex`. Supports TTL-based expiry, periodic cleanup, and JSON file persistence.
 - **IPSet** (`ipset.go`) — Wraps Linux `ipset` CLI. Gracefully degrades when unavailable (macOS, no permissions).
 - **Defaults** (`defaults.go`) — Built-in `RuleFile` used when no rule_file/rule_url is configured.
 - **Caddyfile** (`caddyfile.go`) — Caddyfile unmarshaling and interface guards.
@@ -46,7 +46,19 @@ Blocked requests get a random 4xx status code. Banned IPs are stored in-memory (
 
 ### Concurrency Model
 
-RuleManager uses `sync.RWMutex` — readers (ServeHTTP) take RLock, writers (file reload, URL refresh) take full Lock. Store has its own independent RWMutex.
+RuleManager uses `sync.RWMutex` — readers (ServeHTTP) take RLock, writers (file reload, URL refresh) take full Lock. Store has its own independent RWMutex. Store cleanup goroutine uses `caddy.Context` for lifecycle management.
+
+## Caddy Extension Best Practices
+
+This project follows Caddy module development conventions:
+
+- **Goroutine lifecycle**: All background goroutines must accept `context.Context` from `caddy.Context` and exit on `ctx.Done()`. Never use custom stop channels — Caddy cancels the context automatically on module unload.
+- **HTTP clients**: Use a dedicated package-level `http.Client` with explicit `Timeout`. Never use `http.DefaultClient` (global state, no timeout). See `httpClient` in `rules.go`.
+- **UsagePool**: Shared resources (like `RuleManager`) use `caddy.UsagePool` for ref-counting across config reloads. Multiple sites with identical configs share one instance.
+- **Module overlap**: During config reloads, new modules start before old ones stop. Design for concurrent old/new instances.
+- **Provision vs Cleanup**: `Provision()` sets up resources and starts goroutines. `Cleanup()` releases resources. Context cancellation handles goroutine shutdown.
+- **Logging**: Always use `ctx.Logger()` (zap), never Go's `log` package.
+- **Interface guards**: Compile-time checks in `caddyfile.go` ensure all required interfaces are implemented.
 
 ## Caddyfile Options
 

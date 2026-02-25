@@ -1,7 +1,6 @@
 package ipban
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -171,11 +170,13 @@ type fetchResult struct {
 	changed bool   // false if 304 Not Modified
 }
 
+// httpClient is a dedicated client for fetching remote rules,
+// isolated from http.DefaultClient to avoid global state interference.
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
 // fetchFromURL downloads rules, using ETag for conditional requests.
 func fetchFromURL(url, lastETag string) (*fetchResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -184,7 +185,7 @@ func fetchFromURL(url, lastETag string) (*fetchResult, error) {
 	if lastETag != "" {
 		req.Header.Set("If-None-Match", lastETag)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

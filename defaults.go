@@ -23,7 +23,7 @@ var defaultRuleFile = RuleFile{
 			PathPrefix: []string{
 				"/.env.", "/.git/", "/.svn/",
 				"/wp-admin/", "/wp-content/uploads/", "/wp-includes/",
-				"/phpmyadmin", "/pma/", "/myadmin/", "/phpMyAdmin",
+				"/phpmyadmin", "/pma/", "/myadmin/",
 				"/cgi-bin/",
 				"/actuator/", "/jmx-console/",
 				"/manager/html", "/manager/status",

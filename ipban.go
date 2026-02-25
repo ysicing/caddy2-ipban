@@ -109,6 +109,7 @@ func (m *IPBan) Provision(ctx caddy.Context) error {
 	if err != nil {
 		return fmt.Errorf("ipban: init store: %v", err)
 	}
+	m.store.StartCleanup(ctx, 5*time.Minute)
 
 	m.ipset = NewIPSet(m.IPSetName)
 	if m.IPSetName != "" && !m.ipset.Available() {

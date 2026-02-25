@@ -1,6 +1,7 @@
 package ipban
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"sync"
@@ -103,6 +104,23 @@ func (s *Store) Cleanup() {
 	if s.filePath != "" {
 		_ = s.save()
 	}
+}
+
+// StartCleanup begins a background goroutine that periodically removes expired entries.
+// The goroutine exits when ctx is cancelled (standard Caddy lifecycle pattern).
+func (s *Store) StartCleanup(ctx context.Context, interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.Cleanup()
+			}
+		}
+	}()
 }
 
 func (s *Store) load() error {
