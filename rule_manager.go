@@ -36,6 +36,15 @@ type RuleManager struct {
 // NewRuleManager creates a manager that loads and watches rules.
 // cacheDir is used to persist remote rules locally; empty disables caching.
 func NewRuleManager(filePath, url, cacheDir string, interval time.Duration, logger *zap.Logger) (*RuleManager, error) {
+	// Resolve to absolute path so fsnotify watches a specific directory,
+	// not "." (which would fire on every file in the working directory).
+	if filePath != "" {
+		abs, err := filepath.Abs(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("resolve rule file path: %w", err)
+		}
+		filePath = abs
+	}
 	rm := &RuleManager{
 		filePath: filePath,
 		url:      url,
@@ -77,7 +86,7 @@ func (rm *RuleManager) Start() {
 				_ = w.Close()
 				rm.watcher = nil
 			} else {
-				go rm.watchFile(ctx)
+				go rm.watchFile(ctx, w)
 			}
 		}
 	}
@@ -90,7 +99,9 @@ func (rm *RuleManager) Start() {
 func (rm *RuleManager) Stop() {
 	rm.mu.Lock()
 	cancel := rm.cancel
+	rm.cancel = nil
 	watcher := rm.watcher
+	rm.watcher = nil
 	rm.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -109,8 +120,8 @@ func (rm *RuleManager) Destruct() error {
 // Match checks if a request matches any loaded rule.
 // Path and UA are lowercased once here to avoid per-rule allocations.
 func (rm *RuleManager) Match(path, ua string) bool {
-	lp := strings.ToLower(path)
-	lua := strings.ToLower(ua)
+	lp := toLowerFast(path)
+	lua := toLowerFast(ua)
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
 	for _, cr := range rm.fileRules {
@@ -136,25 +147,35 @@ func (rm *RuleManager) loadAll() error {
 		rm.fileRules = rules
 	}
 
-	// Load remote rules: try fetch, fall back to cache
+	// Load remote rules: prefer local cache to avoid blocking startup,
+	// then let the background refresher update asynchronously.
 	if rm.url != "" {
-		result, err := fetchFromURL(context.Background(), rm.url, "")
-		if err != nil {
-			// Try loading from local cache
-			if rules := rm.loadCache(); rules != nil {
-				rm.urlRules = rules
-				rm.logger.Warn("remote rules unavailable, loaded from cache",
-					zap.String("url", rm.url), zap.Error(err))
-			} else if rm.filePath != "" {
-				rm.logger.Warn("remote rules unavailable, no cache, using local only",
-					zap.String("url", rm.url), zap.Error(err))
-			} else {
-				return err
-			}
+		cached := rm.loadCache()
+		if cached != nil {
+			// Cache hit — use cached rules + etag immediately.
+			// The background refreshURL goroutine will update on the next tick.
+			rm.urlRules = cached.rules
+			rm.etag = cached.etag
+			rm.logger.Info("remote rules loaded from cache",
+				zap.String("url", rm.url), zap.Int("rules", len(cached.rules)))
 		} else {
-			rm.urlRules = result.rules
-			rm.etag = result.etag
-			rm.saveCache(result.data)
+			// No cache — must fetch synchronously, but with a short timeout
+			// to avoid blocking Caddy startup for 30s on network failure.
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			result, err := fetchFromURL(ctx, rm.url, "")
+			if err != nil {
+				if rm.filePath != "" {
+					rm.logger.Warn("remote rules unavailable, no cache, using local only",
+						zap.String("url", rm.url), zap.Error(err))
+				} else {
+					return err
+				}
+			} else {
+				rm.urlRules = result.rules
+				rm.etag = result.etag
+				rm.saveCache(result.data, result.etag)
+			}
 		}
 	}
 
@@ -171,10 +192,13 @@ func (rm *RuleManager) loadAll() error {
 
 // --- file watcher ---
 
-func (rm *RuleManager) watchFile(ctx context.Context) {
+func (rm *RuleManager) watchFile(ctx context.Context, w *fsnotify.Watcher) {
 	target := filepath.Clean(rm.filePath)
 
 	reload := func() {
+		if ctx.Err() != nil {
+			return // context cancelled, skip reload
+		}
 		rules, err := loadFromFile(rm.filePath)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -200,7 +224,7 @@ func (rm *RuleManager) watchFile(ctx context.Context) {
 				rm.debounce.Stop()
 			}
 			return
-		case event, ok := <-rm.watcher.Events:
+		case event, ok := <-w.Events:
 			if !ok {
 				return
 			}
@@ -215,7 +239,7 @@ func (rm *RuleManager) watchFile(ctx context.Context) {
 				rm.debounce.Stop()
 			}
 			rm.debounce = time.AfterFunc(500*time.Millisecond, reload)
-		case err, ok := <-rm.watcher.Errors:
+		case err, ok := <-w.Errors:
 			if !ok {
 				return
 			}
@@ -252,7 +276,7 @@ func (rm *RuleManager) refreshURL(ctx context.Context) {
 			rm.etag = result.etag
 			rm.urlRules = result.rules
 			rm.mu.Unlock()
-			rm.saveCache(result.data)
+			rm.saveCache(result.data, result.etag)
 			rm.logger.Info("remote rules refreshed",
 				zap.String("url", rm.url), zap.Int("rules", len(result.rules)))
 		}
@@ -270,7 +294,7 @@ func (rm *RuleManager) cachePath() string {
 	return filepath.Join(rm.cacheDir, name)
 }
 
-func (rm *RuleManager) saveCache(data []byte) {
+func (rm *RuleManager) saveCache(data []byte, etag string) {
 	p := rm.cachePath()
 	if p == "" || len(data) == 0 {
 		return
@@ -282,9 +306,18 @@ func (rm *RuleManager) saveCache(data []byte) {
 	if err := atomicWriteFile(p, data, 0600); err != nil {
 		rm.logger.Warn("cache write failed", zap.Error(err))
 	}
+	// Persist ETag alongside cache so restarts can use conditional requests.
+	if etag != "" {
+		_ = atomicWriteFile(p+".etag", []byte(etag), 0600)
+	}
 }
 
-func (rm *RuleManager) loadCache() []*compiledRule {
+type cacheResult struct {
+	rules []*compiledRule
+	etag  string
+}
+
+func (rm *RuleManager) loadCache() *cacheResult {
 	p := rm.cachePath()
 	if p == "" {
 		return nil
@@ -293,5 +326,22 @@ func (rm *RuleManager) loadCache() []*compiledRule {
 	if err != nil {
 		return nil
 	}
-	return rules
+	etag := ""
+	if data, err := os.ReadFile(p + ".etag"); err == nil {
+		etag = string(data)
+	}
+	return &cacheResult{rules: rules, etag: etag}
+}
+
+// toLowerFast returns the lowercase version of s.
+// For pure ASCII strings (the common case for URL paths and UAs),
+// it avoids heap allocation by checking if the string is already lowercase.
+func toLowerFast(s string) string {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			return strings.ToLower(s)
+		}
+	}
+	return s // already lowercase, zero alloc
 }

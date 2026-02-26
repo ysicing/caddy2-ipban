@@ -40,13 +40,16 @@ const maxBanEntries = 100000
 type Store struct {
 	mu             sync.RWMutex
 	records        map[string]*BanRecord
-	hits           map[string]*hitRecord
 	filePath       string
 	saveTimer      *time.Timer
 	logger         *zap.Logger
 	cancel         context.CancelFunc
-	hitsFullLogged bool            // log once when hits map is full
 	onExpire       func(ip string) // called outside lock when an expired IP is removed
+	saveGen        uint64          // incremented on each debounceSave; lets Cleanup invalidate pending callbacks
+
+	hitsMu         sync.Mutex // independent lock for hits — avoids blocking IsBanned readers
+	hits           map[string]*hitRecord
+	hitsFullLogged bool // log once when hits map is full
 }
 
 // NewStore creates a store, loading persisted data if filePath is set.
@@ -110,12 +113,13 @@ func (s *Store) Unban(ip string) bool {
 	_, ok := s.records[ip]
 	if ok {
 		delete(s.records, ip)
-	}
-	delete(s.hits, ip)
-	if ok {
 		s.debounceSave()
 	}
 	s.mu.Unlock()
+
+	s.hitsMu.Lock()
+	delete(s.hits, ip)
+	s.hitsMu.Unlock()
 	return ok
 }
 
@@ -143,7 +147,18 @@ func (s *Store) debounceSave() {
 	if s.saveTimer != nil {
 		s.saveTimer.Stop()
 	}
+	s.saveGen++
+	gen := s.saveGen
 	s.saveTimer = time.AfterFunc(time.Second, func() {
+		s.mu.Lock()
+		// If generation changed, Cleanup (or another debounceSave) already
+		// cancelled us and will handle persistence — skip this write.
+		if s.saveGen != gen {
+			s.mu.Unlock()
+			return
+		}
+		s.saveTimer = nil
+		s.mu.Unlock()
 		if err := s.save(); err != nil && s.logger != nil {
 			s.logger.Warn("persist save failed", zap.Error(err))
 		}
@@ -153,8 +168,8 @@ func (s *Store) debounceSave() {
 // RecordHit increments the hit counter for an IP within a sliding window.
 // Returns the current count. If the window has elapsed, the counter resets.
 func (s *Store) RecordHit(ip string, window time.Duration) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.hitsMu.Lock()
+	defer s.hitsMu.Unlock()
 
 	now := time.Now()
 	h, ok := s.hits[ip]
@@ -179,9 +194,9 @@ func (s *Store) RecordHit(ip string, window time.Duration) int {
 
 // ClearHits removes the hit counter for an IP (called after banning).
 func (s *Store) ClearHits(ip string) {
-	s.mu.Lock()
+	s.hitsMu.Lock()
 	delete(s.hits, ip)
-	s.mu.Unlock()
+	s.hitsMu.Unlock()
 }
 
 // SetOnExpire registers a callback invoked (outside the lock) when an expired IP is removed.
@@ -196,7 +211,9 @@ func (s *Store) Cleanup() {
 	s.mu.Lock()
 	if s.saveTimer != nil {
 		s.saveTimer.Stop()
+		s.saveTimer = nil
 	}
+	s.saveGen++ // invalidate any in-flight debounceSave callback
 	now := time.Now()
 	var expiredIPs []string
 	for ip, r := range s.records {
@@ -207,6 +224,11 @@ func (s *Store) Cleanup() {
 			}
 		}
 	}
+	onExpire := s.onExpire
+	s.mu.Unlock()
+
+	// Clean up expired hits under separate lock.
+	s.hitsMu.Lock()
 	for ip, h := range s.hits {
 		if now.Sub(h.firstHit) > h.window {
 			delete(s.hits, ip)
@@ -215,8 +237,7 @@ func (s *Store) Cleanup() {
 	if s.hitsFullLogged && len(s.hits) < maxHitEntries {
 		s.hitsFullLogged = false
 	}
-	onExpire := s.onExpire
-	s.mu.Unlock()
+	s.hitsMu.Unlock()
 
 	// Remove expired IPs from ipset outside the lock.
 	for _, ip := range expiredIPs {
@@ -261,8 +282,10 @@ func (s *Store) Stop() {
 	s.mu.Lock()
 	if s.saveTimer != nil {
 		s.saveTimer.Stop()
+		s.saveTimer = nil
 	}
 	cancel := s.cancel
+	s.cancel = nil
 	s.mu.Unlock()
 	if cancel != nil {
 		cancel()

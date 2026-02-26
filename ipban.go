@@ -77,6 +77,10 @@ var rulePool = caddy.NewUsagePool()
 // A malicious IP banned on one site is banned everywhere.
 var storePool = caddy.NewUsagePool()
 
+// ipsetPool allows all sites to share a single IPSet instance,
+// avoiding redundant ipset create/list commands and ban restores on startup.
+var ipsetPool = caddy.NewUsagePool()
+
 // CaddyModule returns the Caddy module information.
 func (IPBan) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
@@ -148,44 +152,52 @@ func (m *IPBan) Provision(ctx caddy.Context) error {
 	}
 	m.ruleMgr = val.(*RuleManager)
 
-	// Store is shared across all sites via storePool — malicious IPs are banned globally.
-	// Persists to <caddy_data_dir>/ipban_bans.json.
-	persistPath := filepath.Join(caddy.AppDataDir(), "ipban_bans.json")
-	storeVal, _, err := storePool.LoadOrNew("store", func() (caddy.Destructor, error) {
-		s, err := NewStore(persistPath, m.logger)
-		if err != nil {
-			return nil, err
-		}
-		s.StartCleanup(5 * time.Minute)
+	// IPSet is shared via ipsetPool — one init, one batch worker, one ban restore.
+	logger := m.logger
+	ipsetVal, _, err := ipsetPool.LoadOrNew("ipset", func() (caddy.Destructor, error) {
+		s := NewIPSet(defaultIPSetName, logger)
+		s.Start()
 		return s, nil
 	})
 	if err != nil {
-		return fmt.Errorf("ipban: init store: %w", err)
+		_, _ = rulePool.Delete(m.ruleKey)
+		return fmt.Errorf("ipban: init ipset: %w", err)
 	}
-	m.store = storeVal.(*Store)
-	setActiveStore(m.store)
-
-	m.ipset = NewIPSet(defaultIPSetName)
+	m.ipset = ipsetVal.(*IPSet)
 	setActiveIPSet(m.ipset)
 	if !m.ipset.Available() {
 		m.logger.Debug("ipset not available, using in-process blocking only")
 	}
 
-	// Sync ipset removal when bans expire during cleanup.
-	if m.ipset.Available() {
-		ipset := m.ipset
-		logger := m.logger
-		m.store.SetOnExpire(func(ip string) {
-			if err := ipset.Del(ip); err != nil {
-				logger.Warn("ipset del on expiry failed", zap.String("ip", ip), zap.Error(err))
-			}
-		})
-	} else {
-		m.store.SetOnExpire(nil)
+	// Store is shared across all sites via storePool — malicious IPs are banned globally.
+	// Persists to <caddy_data_dir>/ipban_bans.json.
+	persistPath := filepath.Join(caddy.AppDataDir(), "ipban_bans.json")
+	ipset := m.ipset
+	storeVal, storeLoaded, err := storePool.LoadOrNew("store", func() (caddy.Destructor, error) {
+		s, err := NewStore(persistPath, logger)
+		if err != nil {
+			return nil, err
+		}
+		if ipset.Available() {
+			s.SetOnExpire(func(ip string) {
+				if err := ipset.Del(ip); err != nil {
+					logger.Warn("ipset del on expiry failed", zap.String("ip", ip), zap.Error(err))
+				}
+			})
+		}
+		s.StartCleanup(5 * time.Minute)
+		return s, nil
+	})
+	if err != nil {
+		_, _ = rulePool.Delete(m.ruleKey)
+		_, _ = ipsetPool.Delete("ipset")
+		return fmt.Errorf("ipban: init store: %w", err)
 	}
+	m.store = storeVal.(*Store)
+	setActiveStore(m.store)
 
-	// Restore persisted bans into ipset after reboot/reload.
-	if m.ipset.Available() {
+	// Restore persisted bans to ipset only on first creation (not on every Provision call).
+	if !storeLoaded && m.ipset.Available() {
 		banned := m.store.ListBanned()
 		if len(banned) > 0 {
 			ips := make([]string, len(banned))
@@ -211,10 +223,22 @@ func (m *IPBan) Provision(ctx caddy.Context) error {
 
 // Validate ensures the configuration is valid.
 func (m *IPBan) Validate() error {
+	if len(m.StatusCodes) == 0 {
+		return fmt.Errorf("ipban: status_codes must not be empty")
+	}
 	for _, code := range m.StatusCodes {
 		if code < 400 || code > 499 {
 			return fmt.Errorf("ipban: status code %d is not a 4xx code", code)
 		}
+	}
+	if time.Duration(m.BanDuration) < 0 {
+		return fmt.Errorf("ipban: ban_duration cannot be negative")
+	}
+	if time.Duration(m.ThresholdWindow) < 0 {
+		return fmt.Errorf("ipban: threshold_window cannot be negative")
+	}
+	if time.Duration(m.RefreshInterval) < 0 {
+		return fmt.Errorf("ipban: refresh_interval cannot be negative")
 	}
 	return nil
 }
@@ -233,14 +257,13 @@ func (m *IPBan) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp
 	}
 
 	if m.ruleMgr.Match(r.URL.Path, r.UserAgent()) {
-		reason := truncatedReason(r.URL.Path, r.UserAgent())
-		host := truncateField(r.Host, 256)
 		window := time.Duration(m.ThresholdWindow)
 		count := m.store.RecordHit(ip, window)
 		if count >= m.Threshold {
-			if m.ban(ip, reason, host) {
-				m.store.ClearHits(ip)
-			}
+			reason := truncatedReason(r.URL.Path, r.UserAgent())
+			host := sanitizeLogField(truncateField(r.Host, 256))
+			m.store.ClearHits(ip)
+			m.ban(ip, reason, host)
 		}
 		return m.block(w)
 	}
@@ -256,6 +279,9 @@ func (m *IPBan) Cleanup() error {
 	deleted, _ := storePool.Delete("store")
 	if deleted {
 		setActiveStore(nil)
+	}
+	deleted, _ = ipsetPool.Delete("ipset")
+	if deleted {
 		setActiveIPSet(nil)
 	}
 	return nil
@@ -266,13 +292,7 @@ func (m *IPBan) ban(ip, reason, host string) bool {
 	if !m.store.Ban(ip, reason, host, dur) {
 		return false
 	}
-	if m.ipset.Available() {
-		go func(ipStr string) {
-			if err := m.ipset.Add(ipStr); err != nil {
-				m.logger.Error("ipset add failed", zap.String("ip", ipStr), zap.Error(err))
-			}
-		}(ip)
-	}
+	m.ipset.QueueAdd(ip)
 	m.logger.Info("ip banned", zap.String("ip", ip), zap.String("reason", reason))
 	return true
 }

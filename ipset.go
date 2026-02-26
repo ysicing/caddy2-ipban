@@ -7,7 +7,10 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 // ipsetTimeout is the maximum time allowed for a single ipset command.
@@ -17,15 +20,23 @@ const ipsetTimeout = 10 * time.Second
 var validIPSetName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 // IPSet wraps the Linux ipset command for kernel-level IP blocking.
+// Supports batched async adds via a background worker to avoid
+// forking thousands of processes under burst traffic.
 type IPSet struct {
 	name      string
 	available bool
+	logger    *zap.Logger
+
+	// Batching: QueueAdd sends IPs here; the worker flushes via AddBatch.
+	banCh    chan string
+	stopOnce sync.Once
+	done     chan struct{}
 }
 
 // NewIPSet creates an IPSet handle. If the set doesn't exist it tries to create one.
 // Names containing invalid characters are rejected (available=false).
-func NewIPSet(name string) *IPSet {
-	s := &IPSet{name: name}
+func NewIPSet(name string, logger *zap.Logger) *IPSet {
+	s := &IPSet{name: name, logger: logger}
 	if name != "" {
 		if !validIPSetName.MatchString(name) {
 			return s // available remains false
@@ -37,6 +48,86 @@ func NewIPSet(name string) *IPSet {
 
 // Available reports whether ipset can be used.
 func (s *IPSet) Available() bool { return s.available }
+
+// Start launches the background batch worker. No-op if ipset is unavailable.
+func (s *IPSet) Start() {
+	if !s.available {
+		return
+	}
+	s.banCh = make(chan string, 1024)
+	s.done = make(chan struct{})
+	go s.batchWorker()
+}
+
+// Stop shuts down the batch worker and flushes pending IPs.
+func (s *IPSet) Stop() {
+	s.stopOnce.Do(func() {
+		if s.banCh != nil {
+			close(s.banCh)
+			<-s.done // wait for worker to drain and exit
+		}
+	})
+}
+
+// Destruct implements caddy.Destructor for UsagePool ref-counting.
+func (s *IPSet) Destruct() error {
+	s.Stop()
+	return nil
+}
+
+// QueueAdd enqueues an IP for batched addition to the kernel set.
+// Non-blocking: if the channel is full, the IP is dropped (still banned in-memory).
+func (s *IPSet) QueueAdd(ip string) {
+	if !s.available || s.banCh == nil {
+		return
+	}
+	if net.ParseIP(ip) == nil {
+		return
+	}
+	select {
+	case s.banCh <- ip:
+	default:
+		if s.logger != nil {
+			s.logger.Warn("ipset batch channel full, dropping add",
+				zap.String("ip", ip))
+		}
+	}
+}
+
+// batchWorker collects IPs from banCh and flushes them via AddBatch
+// every 2 seconds or when 100 IPs accumulate, whichever comes first.
+func (s *IPSet) batchWorker() {
+	defer close(s.done)
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	var pending []string
+
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+		if err := s.AddBatch(pending); err != nil && s.logger != nil {
+			s.logger.Warn("ipset batch add failed", zap.Error(err), zap.Int("count", len(pending)))
+		}
+		pending = pending[:0]
+	}
+
+	for {
+		select {
+		case ip, ok := <-s.banCh:
+			if !ok {
+				flush()
+				return
+			}
+			pending = append(pending, ip)
+			if len(pending) >= 100 {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
 
 // Add inserts an IP into the set. No-op if ipset is unavailable.
 // The IP is validated before passing to the ipset command.

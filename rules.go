@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -132,6 +133,12 @@ func compileRuleFile(rf *RuleFile) ([]*compiledRule, error) {
 	return out, nil
 }
 
+// maxRules limits the total number of rules per RuleFile to prevent CPU exhaustion.
+const maxRules = 1000
+
+// maxPatternsPerRule limits patterns within a single rule.
+const maxPatternsPerRule = 100
+
 func parseAndCompile(data []byte) ([]*compiledRule, error) {
 	var rf RuleFile
 	if err := json.Unmarshal(data, &rf); err != nil {
@@ -139,6 +146,16 @@ func parseAndCompile(data []byte) ([]*compiledRule, error) {
 	}
 	if rf.Version != 1 {
 		return nil, fmt.Errorf("unsupported rule version: %d", rf.Version)
+	}
+	if len(rf.Rules) > maxRules {
+		return nil, fmt.Errorf("too many rules: %d (max %d)", len(rf.Rules), maxRules)
+	}
+	for i, r := range rf.Rules {
+		total := len(r.Path) + len(r.PathPrefix) + len(r.PathKeyword) +
+			len(r.PathRegex) + len(r.UserAgentKeyword) + len(r.UserAgentRegex)
+		if total > maxPatternsPerRule {
+			return nil, fmt.Errorf("rule[%d]: too many patterns: %d (max %d)", i, total, maxPatternsPerRule)
+		}
 	}
 	return compileRuleFile(&rf)
 }
@@ -172,8 +189,15 @@ var httpClient = &http.Client{
 }
 
 // fetchFromURL downloads rules, using ETag for conditional requests.
-func fetchFromURL(ctx context.Context, url, lastETag string) (*fetchResult, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func fetchFromURL(ctx context.Context, rawURL, lastETag string) (*fetchResult, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid rule URL: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported URL scheme %q, only http/https allowed", parsed.Scheme)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -192,7 +216,7 @@ func fetchFromURL(ctx context.Context, url, lastETag string) (*fetchResult, erro
 		return &fetchResult{changed: false}, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
+		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, rawURL)
 	}
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20)) // 10MB limit

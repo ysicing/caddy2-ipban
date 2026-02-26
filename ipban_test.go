@@ -428,7 +428,7 @@ func newTestIPBan(t *testing.T) *IPBan {
 		Threshold:    1,
 		ruleMgr:      rm,
 		store:        store,
-		ipset:        NewIPSet(""),
+		ipset:        NewIPSet("", nil),
 		logger:       zap.NewNop(),
 	}
 }
@@ -477,5 +477,116 @@ func TestServeHTTP_BlocksBannedIP(t *testing.T) {
 	_ = m.ServeHTTP(w, r, next)
 	if w.Code != 403 {
 		t.Errorf("expected 403, got %d", w.Code)
+	}
+}
+
+func TestSanitizeLogField(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"normal text", "normal text"},
+		{"has\nnewline", "hasnewline"},
+		{"has\rcarriage", "hascarriage"},
+		{"has\ttab", "hastab"},
+		{"clean", "clean"},
+		{"", ""},
+		{"\x00\x01\x02", ""},
+		{"a\x00b\x01c", "abc"},
+	}
+	for _, tt := range tests {
+		if got := sanitizeLogField(tt.in); got != tt.want {
+			t.Errorf("sanitizeLogField(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		m       IPBan
+		wantErr bool
+	}{
+		{"valid", IPBan{StatusCodes: []int{403}}, false},
+		{"empty status codes", IPBan{}, true},
+		{"non-4xx code", IPBan{StatusCodes: []int{500}}, true},
+		{"negative ban_duration", IPBan{StatusCodes: []int{403}, BanDuration: caddy.Duration(-time.Hour)}, true},
+		{"negative threshold_window", IPBan{StatusCodes: []int{403}, ThresholdWindow: caddy.Duration(-time.Hour)}, true},
+		{"negative refresh_interval", IPBan{StatusCodes: []int{403}, RefreshInterval: caddy.Duration(-time.Hour)}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.m.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestStoreMaxBanEntries(t *testing.T) {
+	s, _ := NewStore("", nil)
+	for i := 0; i < maxBanEntries; i++ {
+		ip := fmt.Sprintf("10.%d.%d.%d", (i>>16)&0xff, (i>>8)&0xff, i&0xff)
+		if !s.Ban(ip, "test", "", 0) {
+			t.Fatalf("Ban should succeed at entry %d", i)
+		}
+	}
+	if s.Ban("99.99.99.99", "test", "", 0) {
+		t.Error("Ban should fail when table is full")
+	}
+	if !s.Ban("10.0.0.0", "updated", "", 0) {
+		t.Error("Re-banning existing IP should succeed even when full")
+	}
+}
+
+func TestStoreMaxHitEntries(t *testing.T) {
+	s, _ := NewStore("", nil)
+	for i := 0; i < maxHitEntries; i++ {
+		ip := fmt.Sprintf("10.%d.%d.%d", (i>>16)&0xff, (i>>8)&0xff, i&0xff)
+		s.RecordHit(ip, time.Hour)
+	}
+	if c := s.RecordHit("99.99.99.99", time.Hour); c != 0 {
+		t.Errorf("RecordHit should return 0 when full, got %d", c)
+	}
+}
+
+func TestStoreCleanupExpired(t *testing.T) {
+	s, _ := NewStore("", nil)
+	var expiredIPs []string
+	s.SetOnExpire(func(ip string) {
+		expiredIPs = append(expiredIPs, ip)
+	})
+
+	s.Ban("1.1.1.1", "test", "", 1*time.Millisecond)
+	s.Ban("2.2.2.2", "test", "", 0)
+	time.Sleep(5 * time.Millisecond)
+
+	s.Cleanup()
+
+	if s.IsBanned("1.1.1.1") {
+		t.Error("1.1.1.1 should be cleaned up")
+	}
+	if !s.IsBanned("2.2.2.2") {
+		t.Error("2.2.2.2 should still be banned (permanent)")
+	}
+	if len(expiredIPs) != 1 || expiredIPs[0] != "1.1.1.1" {
+		t.Errorf("onExpire should be called for 1.1.1.1, got %v", expiredIPs)
+	}
+}
+
+func TestToLowerFast(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"/already/lower", "/already/lower"},
+		{"/HAS/UPPER", "/has/upper"},
+		{"/Mixed/Case", "/mixed/case"},
+		{"", ""},
+		{"/.env", "/.env"},
+	}
+	for _, tt := range tests {
+		if got := toLowerFast(tt.in); got != tt.want {
+			t.Errorf("toLowerFast(%q) = %q, want %q", tt.in, got, tt.want)
+		}
 	}
 }

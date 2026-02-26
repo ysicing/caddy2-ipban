@@ -199,7 +199,7 @@ func TestAdminHandleListMethodNotAllowed(t *testing.T) {
 
 func TestIPSetDel(t *testing.T) {
 	// IPSet with no name — Del should be a no-op.
-	s := NewIPSet("")
+	s := NewIPSet("", nil)
 	if err := s.Del("1.2.3.4"); err != nil {
 		t.Fatalf("Del on unavailable ipset should be no-op, got: %v", err)
 	}

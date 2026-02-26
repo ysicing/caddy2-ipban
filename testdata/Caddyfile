@@ -6,7 +6,8 @@
 }
 
 :8080 {
-	ipban
-
+	ipban {
+		status_codes 400 403 404 429 451
+	}
 	respond "Hello, World!" 200
 }
