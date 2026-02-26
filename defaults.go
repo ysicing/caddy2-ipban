@@ -44,8 +44,6 @@ var defaultRuleFile = RuleFile{
 				"xray", "crawlergo", "httpx", "subfinder",
 				"censys", "shodan", "netcraft",
 				"scanner", "exploit",
-				"python-requests",
-				"go-http-client",
 			},
 		},
 	},

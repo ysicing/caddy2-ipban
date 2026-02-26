@@ -2,6 +2,8 @@ package ipban
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,11 +26,11 @@ type RuleManager struct {
 	watcher   *fsnotify.Watcher
 	debounce  *time.Timer
 
-	filePath  string
-	url       string
-	etag      string // last ETag from remote
-	cacheDir  string // directory for caching remote rules
-	interval  time.Duration
+	filePath string
+	url      string
+	etag     string // last ETag from remote
+	cacheDir string // directory for caching remote rules
+	interval time.Duration
 }
 
 // NewRuleManager creates a manager that loads and watches rules.
@@ -52,11 +54,14 @@ func NewRuleManager(filePath, url, cacheDir string, interval time.Duration, logg
 // UsagePool across multiple Caddy modules, so their lifecycle is managed by
 // reference counting (Destruct), not by any single module's context.
 func (rm *RuleManager) Start() {
+	rm.mu.Lock()
 	if rm.cancel != nil {
+		rm.mu.Unlock()
 		return // already started
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	rm.cancel = cancel
+	rm.mu.Unlock()
 
 	if rm.filePath != "" {
 		w, err := fsnotify.NewWatcher()
@@ -69,7 +74,7 @@ func (rm *RuleManager) Start() {
 			dir := filepath.Dir(rm.filePath)
 			if err := w.Add(dir); err != nil {
 				rm.logger.Error("fsnotify watch failed", zap.String("dir", dir), zap.Error(err))
-				w.Close()
+				_ = w.Close()
 				rm.watcher = nil
 			} else {
 				go rm.watchFile(ctx)
@@ -83,11 +88,15 @@ func (rm *RuleManager) Start() {
 
 // Stop terminates background goroutines and closes the file watcher.
 func (rm *RuleManager) Stop() {
-	if rm.cancel != nil {
-		rm.cancel()
+	rm.mu.Lock()
+	cancel := rm.cancel
+	watcher := rm.watcher
+	rm.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
-	if rm.watcher != nil {
-		rm.watcher.Close()
+	if watcher != nil {
+		_ = watcher.Close()
 	}
 }
 
@@ -253,10 +262,12 @@ func (rm *RuleManager) refreshURL(ctx context.Context) {
 // --- local cache for remote rules ---
 
 func (rm *RuleManager) cachePath() string {
-	if rm.cacheDir == "" {
+	if rm.cacheDir == "" || rm.url == "" {
 		return ""
 	}
-	return filepath.Join(rm.cacheDir, "ipban_remote_rules.json")
+	h := sha256.Sum256([]byte(rm.url))
+	name := fmt.Sprintf("ipban_remote_rules_%x.json", h[:8])
+	return filepath.Join(rm.cacheDir, name)
 }
 
 func (rm *RuleManager) saveCache(data []byte) {
@@ -264,11 +275,11 @@ func (rm *RuleManager) saveCache(data []byte) {
 	if p == "" || len(data) == 0 {
 		return
 	}
-	if err := os.MkdirAll(rm.cacheDir, 0755); err != nil {
+	if err := os.MkdirAll(rm.cacheDir, 0700); err != nil {
 		rm.logger.Warn("cache dir create failed", zap.Error(err))
 		return
 	}
-	if err := atomicWriteFile(p, data, 0644); err != nil {
+	if err := atomicWriteFile(p, data, 0600); err != nil {
 		rm.logger.Warn("cache write failed", zap.Error(err))
 	}
 }

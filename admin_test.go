@@ -127,13 +127,16 @@ func TestAdminHandleUnban(t *testing.T) {
 		t.Fatal("IP should be unbanned")
 	}
 
-	// Unban non-existent IP should return error.
+	// Unban non-existent IP should still succeed (best-effort ipset cleanup).
 	body = bytes.NewBufferString(`{"ip":"10.0.0.3"}`)
 	w = httptest.NewRecorder()
 	r = httptest.NewRequest(http.MethodPost, "/ipban/unban", body)
 	err = api.handleUnban(w, r)
-	if err == nil {
-		t.Fatal("expected error for non-banned IP")
+	if err != nil {
+		t.Fatalf("unexpected error for non-banned IP: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
 	}
 }
 

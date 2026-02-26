@@ -3,6 +3,7 @@ package ipban
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -31,6 +32,9 @@ type hitRecord struct {
 // from distributed scanning attacks using many unique source IPs.
 const maxHitEntries = 100000
 
+// maxBanEntries limits the records map size to prevent unbounded memory growth.
+const maxBanEntries = 100000
+
 // Store manages banned IPs with optional file persistence.
 // Shared across sites via UsagePool — a malicious IP banned on one site is banned everywhere.
 type Store struct {
@@ -41,7 +45,8 @@ type Store struct {
 	saveTimer      *time.Timer
 	logger         *zap.Logger
 	cancel         context.CancelFunc
-	hitsFullLogged bool // log once when hits map is full
+	hitsFullLogged bool            // log once when hits map is full
+	onExpire       func(ip string) // called outside lock when an expired IP is removed
 }
 
 // NewStore creates a store, loading persisted data if filePath is set.
@@ -61,7 +66,8 @@ func NewStore(filePath string, logger *zap.Logger) (*Store, error) {
 }
 
 // IsBanned checks whether an IP is currently banned.
-// Expired entries are lazily deleted to prevent memory leaks.
+// Expired entries are not deleted here — the background Cleanup goroutine handles that.
+// This keeps IsBanned as a pure read operation (RLock only) on the hot path.
 func (s *Store) IsBanned(ip string) bool {
 	s.mu.RLock()
 	r, ok := s.records[ip]
@@ -71,29 +77,30 @@ func (s *Store) IsBanned(ip string) bool {
 	}
 	expired := r.ExpiresAt != nil && time.Now().After(*r.ExpiresAt)
 	s.mu.RUnlock()
-
-	if expired {
-		s.mu.Lock()
-		if r, ok := s.records[ip]; ok && r.ExpiresAt != nil && time.Now().After(*r.ExpiresAt) {
-			delete(s.records, ip)
-		}
-		s.mu.Unlock()
-		return false
-	}
-	return true
+	return !expired
 }
 
-// Ban adds an IP to the blacklist.
-func (s *Store) Ban(ip, reason, host string, duration time.Duration) {
+// Ban adds an IP to the blacklist. Returns false if the ban table is full.
+func (s *Store) Ban(ip, reason, host string, duration time.Duration) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	r := &BanRecord{IP: ip, Reason: reason, Host: host, BannedAt: time.Now()}
+	// Prevent unbounded growth — skip if at capacity and IP is not already banned.
+	if _, exists := s.records[ip]; !exists && len(s.records) >= maxBanEntries {
+		if s.logger != nil {
+			s.logger.Warn("ban table full, cannot ban new IP",
+				zap.String("ip", ip), zap.Int("limit", maxBanEntries))
+		}
+		return false
+	}
+	now := time.Now()
+	r := &BanRecord{IP: ip, Reason: reason, Host: host, BannedAt: now}
 	if duration > 0 {
-		exp := time.Now().Add(duration)
+		exp := now.Add(duration)
 		r.ExpiresAt = &exp
 	}
 	s.records[ip] = r
 	s.debounceSave()
+	return true
 }
 
 // Unban removes an IP from the ban list and clears its hit counter.
@@ -113,16 +120,17 @@ func (s *Store) Unban(ip string) bool {
 }
 
 // ListBanned returns all currently active (non-expired) ban records.
-func (s *Store) ListBanned() []*BanRecord {
+// Returns copies to prevent external mutation of internal state.
+func (s *Store) ListBanned() []BanRecord {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	now := time.Now()
-	result := make([]*BanRecord, 0, len(s.records))
+	result := make([]BanRecord, 0, len(s.records))
 	for _, r := range s.records {
 		if r.ExpiresAt != nil && now.After(*r.ExpiresAt) {
 			continue
 		}
-		result = append(result, r)
+		result = append(result, *r)
 	}
 	return result
 }
@@ -152,7 +160,8 @@ func (s *Store) RecordHit(ip string, window time.Duration) int {
 	h, ok := s.hits[ip]
 	if !ok || now.Sub(h.firstHit) > h.window {
 		// Prevent unbounded growth from distributed scanning attacks.
-		// When full, drop new entries to avoid false-positive bans.
+		// Don't purge inline — that's O(N) under lock on the hot path.
+		// The background Cleanup() goroutine handles expired entry removal.
 		if !ok && len(s.hits) >= maxHitEntries {
 			if !s.hitsFullLogged && s.logger != nil {
 				s.logger.Warn("hit tracking table full, new IPs will not be tracked",
@@ -175,16 +184,27 @@ func (s *Store) ClearHits(ip string) {
 	s.mu.Unlock()
 }
 
-// Cleanup removes expired entries and persists the result.
+// SetOnExpire registers a callback invoked (outside the lock) when an expired IP is removed.
+func (s *Store) SetOnExpire(fn func(ip string)) {
+	s.mu.Lock()
+	s.onExpire = fn
+	s.mu.Unlock()
+}
+
+// Cleanup removes expired entries, syncs ipset removal, and persists the result.
 func (s *Store) Cleanup() {
 	s.mu.Lock()
 	if s.saveTimer != nil {
 		s.saveTimer.Stop()
 	}
 	now := time.Now()
+	var expiredIPs []string
 	for ip, r := range s.records {
 		if r.ExpiresAt != nil && now.After(*r.ExpiresAt) {
 			delete(s.records, ip)
+			if s.onExpire != nil {
+				expiredIPs = append(expiredIPs, ip)
+			}
 		}
 	}
 	for ip, h := range s.hits {
@@ -192,7 +212,16 @@ func (s *Store) Cleanup() {
 			delete(s.hits, ip)
 		}
 	}
+	if s.hitsFullLogged && len(s.hits) < maxHitEntries {
+		s.hitsFullLogged = false
+	}
+	onExpire := s.onExpire
 	s.mu.Unlock()
+
+	// Remove expired IPs from ipset outside the lock.
+	for _, ip := range expiredIPs {
+		onExpire(ip)
+	}
 
 	if s.filePath != "" {
 		if err := s.save(); err != nil && s.logger != nil {
@@ -227,10 +256,16 @@ func (s *Store) StartCleanup(interval time.Duration) {
 	}()
 }
 
-// Stop terminates the cleanup goroutine.
+// Stop terminates the cleanup goroutine and pending save timer.
 func (s *Store) Stop() {
-	if s.cancel != nil {
-		s.cancel()
+	s.mu.Lock()
+	if s.saveTimer != nil {
+		s.saveTimer.Stop()
+	}
+	cancel := s.cancel
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -254,6 +289,9 @@ func (s *Store) load() error {
 	for _, r := range records {
 		if r.ExpiresAt != nil && now.After(*r.ExpiresAt) {
 			continue
+		}
+		if net.ParseIP(r.IP) == nil {
+			continue // skip invalid IP records
 		}
 		s.records[r.IP] = r
 	}
@@ -289,17 +327,17 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	}
 	tmp := f.Name()
 	if _, err := f.Write(data); err != nil {
-		f.Close()
+		_ = f.Close()
 		os.Remove(tmp)
 		return err
 	}
 	if err := f.Chmod(perm); err != nil {
-		f.Close()
+		_ = f.Close()
 		os.Remove(tmp)
 		return err
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
+		_ = f.Close()
 		os.Remove(tmp)
 		return err
 	}

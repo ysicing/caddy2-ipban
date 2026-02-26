@@ -45,8 +45,6 @@ type IPBan struct {
 	RuleSource string `json:"rule_source,omitempty"`
 	// RefreshInterval for remote rule refresh. Default: 8h.
 	RefreshInterval caddy.Duration `json:"refresh_interval,omitempty"`
-	// IPSetName enables ipset-based kernel blocking. Empty = disabled.
-	IPSetName string `json:"ipset_name,omitempty"`
 	// StatusCodes to randomly return. Default: [451].
 	StatusCodes []int `json:"status_codes,omitempty"`
 	// BanDuration is how long an IP stays banned. 0 = permanent.
@@ -58,13 +56,18 @@ type IPBan struct {
 	// ThresholdWindow is the time window for counting hits. Default: 24h.
 	ThresholdWindow caddy.Duration `json:"threshold_window,omitempty"`
 
-	ruleMgr   *RuleManager
-	store     *Store
-	ipset     *IPSet
-	logger    *zap.Logger
-	ruleKey   string // key for shared RuleManager pool
-	allowNets []*net.IPNet
+	ruleMgr      *RuleManager
+	store        *Store
+	ipset        *IPSet
+	logger       *zap.Logger
+	ruleKey      string // key for shared RuleManager pool
+	allowNets    []*net.IPNet
+	statusBodies [][]byte // pre-computed response bodies for block()
 }
+
+// defaultIPSetName is the fixed ipset name used for kernel-level blocking.
+// ipset is auto-detected — if the ipset CLI is available, it's used automatically.
+const defaultIPSetName = "ipban_blacklist_caddy2"
 
 // rulePool allows multiple sites with identical rule configs to share
 // a single RuleManager (one set of goroutines, one fsnotify watcher).
@@ -88,6 +91,10 @@ func (m *IPBan) Provision(ctx caddy.Context) error {
 
 	if len(m.StatusCodes) == 0 {
 		m.StatusCodes = []int{451}
+	}
+	m.statusBodies = make([][]byte, len(m.StatusCodes))
+	for i, code := range m.StatusCodes {
+		m.statusBodies[i] = []byte(http.StatusText(code))
 	}
 	if m.Threshold <= 0 {
 		m.Threshold = 3
@@ -158,18 +165,35 @@ func (m *IPBan) Provision(ctx caddy.Context) error {
 	m.store = storeVal.(*Store)
 	setActiveStore(m.store)
 
-	m.ipset = NewIPSet(m.IPSetName)
+	m.ipset = NewIPSet(defaultIPSetName)
 	setActiveIPSet(m.ipset)
-	if m.IPSetName != "" && !m.ipset.Available() {
-		m.logger.Warn("ipset not available, using in-process blocking only",
-			zap.String("ipset_name", m.IPSetName))
+	if !m.ipset.Available() {
+		m.logger.Debug("ipset not available, using in-process blocking only")
+	}
+
+	// Sync ipset removal when bans expire during cleanup.
+	if m.ipset.Available() {
+		ipset := m.ipset
+		logger := m.logger
+		m.store.SetOnExpire(func(ip string) {
+			if err := ipset.Del(ip); err != nil {
+				logger.Warn("ipset del on expiry failed", zap.String("ip", ip), zap.Error(err))
+			}
+		})
+	} else {
+		m.store.SetOnExpire(nil)
 	}
 
 	// Restore persisted bans into ipset after reboot/reload.
 	if m.ipset.Available() {
-		for _, r := range m.store.ListBanned() {
-			if err := m.ipset.Add(r.IP); err != nil {
-				m.logger.Warn("ipset restore failed", zap.String("ip", r.IP), zap.Error(err))
+		banned := m.store.ListBanned()
+		if len(banned) > 0 {
+			ips := make([]string, len(banned))
+			for i, r := range banned {
+				ips[i] = r.IP
+			}
+			if err := m.ipset.AddBatch(ips); err != nil {
+				m.logger.Warn("ipset batch restore failed", zap.Error(err))
 			}
 		}
 	}
@@ -210,12 +234,13 @@ func (m *IPBan) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp
 
 	if m.ruleMgr.Match(r.URL.Path, r.UserAgent()) {
 		reason := truncatedReason(r.URL.Path, r.UserAgent())
-		host := r.Host
+		host := truncateField(r.Host, 256)
 		window := time.Duration(m.ThresholdWindow)
 		count := m.store.RecordHit(ip, window)
 		if count >= m.Threshold {
-			m.ban(ip, reason, host)
-			m.store.ClearHits(ip)
+			if m.ban(ip, reason, host) {
+				m.store.ClearHits(ip)
+			}
 		}
 		return m.block(w)
 	}
@@ -236,9 +261,11 @@ func (m *IPBan) Cleanup() error {
 	return nil
 }
 
-func (m *IPBan) ban(ip, reason, host string) {
+func (m *IPBan) ban(ip, reason, host string) bool {
 	dur := time.Duration(m.BanDuration)
-	m.store.Ban(ip, reason, host, dur)
+	if !m.store.Ban(ip, reason, host, dur) {
+		return false
+	}
 	if m.ipset.Available() {
 		go func(ipStr string) {
 			if err := m.ipset.Add(ipStr); err != nil {
@@ -247,22 +274,14 @@ func (m *IPBan) ban(ip, reason, host string) {
 		}(ip)
 	}
 	m.logger.Info("ip banned", zap.String("ip", ip), zap.String("reason", reason))
+	return true
 }
 
 func (m *IPBan) block(w http.ResponseWriter) error {
-	code := m.StatusCodes[rand.IntN(len(m.StatusCodes))]
-	w.WriteHeader(code)
-	_, _ = w.Write([]byte(http.StatusText(code)))
+	idx := rand.IntN(len(m.StatusCodes))
+	w.WriteHeader(m.StatusCodes[idx])
+	_, _ = w.Write(m.statusBodies[idx])
 	return nil
-}
-
-// isPublicIP returns true if the IP string is a public (globally routable) address.
-func isPublicIP(ipStr string) bool {
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return false
-	}
-	return isPublicIPParsed(ip)
 }
 
 // docPrefix is RFC 3849 documentation-only IPv6 range, not covered by net.IP.IsPrivate().
@@ -277,18 +296,6 @@ func isPublicIPParsed(ip net.IP) bool {
 		!ip.IsLinkLocalMulticast() && !ip.IsUnspecified() && !docPrefix.Contains(ip)
 }
 
-// isAllowed checks if the IP matches any allowlist entry.
-func (m *IPBan) isAllowed(ipStr string) bool {
-	if len(m.allowNets) == 0 {
-		return false
-	}
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return false
-	}
-	return m.isAllowedParsed(ip)
-}
-
 // isAllowedParsed checks a pre-parsed IP against the allowlist.
 func (m *IPBan) isAllowedParsed(ip net.IP) bool {
 	for _, n := range m.allowNets {
@@ -301,15 +308,36 @@ func (m *IPBan) isAllowedParsed(ip net.IP) bool {
 
 // truncatedReason builds a ban reason string, truncating path and UA to prevent
 // log injection and excessive log/persistence size.
+// Control characters are stripped to prevent log injection.
 func truncatedReason(path, ua string) string {
-	const maxLen = 256
-	if len(path) > maxLen {
-		path = path[:maxLen] + "..."
-	}
-	if len(ua) > maxLen {
-		ua = ua[:maxLen] + "..."
-	}
+	path = sanitizeLogField(truncateField(path, 256))
+	ua = sanitizeLogField(truncateField(ua, 256))
 	return "path:" + path + " ua:" + ua
+}
+
+// truncateField truncates a string to maxLen, appending "..." if truncated.
+func truncateField(s string, maxLen int) string {
+	if len(s) > maxLen {
+		return s[:maxLen] + "..."
+	}
+	return s
+}
+
+// sanitizeLogField removes control characters (< 0x20) to prevent log injection.
+func sanitizeLogField(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 {
+			// Found a control char — do the full filter.
+			b := make([]byte, 0, len(s))
+			for j := 0; j < len(s); j++ {
+				if s[j] >= 0x20 {
+					b = append(b, s[j])
+				}
+			}
+			return string(b)
+		}
+	}
+	return s // no control chars, zero alloc
 }
 
 func clientIP(r *http.Request) string {

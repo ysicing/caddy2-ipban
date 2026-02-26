@@ -15,7 +15,6 @@ import (
 //	ipban {
 //	    rule_source /etc/caddy/rules.json  OR  https://example.com/rules.json
 //	    refresh_interval 1h
-//	    ipset_name blacklist
 //	    status_codes 400 403 404 429
 //	    ban_duration 24h
 //	    allow 10.0.0.0/8 192.168.0.0/16
@@ -41,11 +40,6 @@ func (m *IPBan) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Errf("invalid refresh_interval: %s", d.Val())
 			}
 			m.RefreshInterval = caddy.Duration(dur)
-		case "ipset_name":
-			if !d.NextArg() {
-				return d.ArgErr()
-			}
-			m.IPSetName = d.Val()
 		case "status_codes":
 			for d.NextArg() {
 				code, err := strconv.Atoi(d.Val())
@@ -65,9 +59,7 @@ func (m *IPBan) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			m.BanDuration = caddy.Duration(dur)
 		case "allow":
 			for d.NextArg() {
-				for _, entry := range strings.Fields(d.Val()) {
-					m.Allowlist = append(m.Allowlist, entry)
-				}
+				m.Allowlist = append(m.Allowlist, strings.Fields(d.Val())...)
 			}
 			if len(m.Allowlist) == 0 {
 				return d.ArgErr()

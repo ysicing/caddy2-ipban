@@ -161,7 +161,15 @@ type fetchResult struct {
 
 // httpClient is a dedicated client for fetching remote rules,
 // isolated from http.DefaultClient to avoid global state interference.
-var httpClient = &http.Client{Timeout: 30 * time.Second}
+var httpClient = &http.Client{
+	Timeout: 30 * time.Second,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 3 {
+			return fmt.Errorf("too many redirects")
+		}
+		return nil
+	},
+}
 
 // fetchFromURL downloads rules, using ETag for conditional requests.
 func fetchFromURL(ctx context.Context, url, lastETag string) (*fetchResult, error) {
@@ -169,7 +177,7 @@ func fetchFromURL(ctx context.Context, url, lastETag string) (*fetchResult, erro
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "caddy-ipban/1.0")
+	req.Header.Set("User-Agent", "caddy-ipban/2.0")
 	req.Header.Set("Accept", "application/json")
 	if lastETag != "" {
 		req.Header.Set("If-None-Match", lastETag)

@@ -2,7 +2,9 @@ package ipban
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -179,7 +181,7 @@ func TestRuleManagerRemoteWithETag(t *testing.T) {
 	}
 
 	// Verify cache file was written
-	cachePath := filepath.Join(cacheDir, "ipban_remote_rules.json")
+	cachePath := rm.cachePath()
 	if _, err := os.Stat(cachePath); os.IsNotExist(err) {
 		t.Error("cache file should exist")
 	}
@@ -195,14 +197,18 @@ func TestRuleManagerRemoteWithETag(t *testing.T) {
 }
 
 func TestRuleManagerCacheFallback(t *testing.T) {
-	// Pre-populate cache
+	// Pre-populate cache with the correct hashed filename
 	cacheDir := t.TempDir()
+	unreachableURL := "http://127.0.0.1:1/unreachable"
 	rf := RuleFile{Version: 1, Rules: []Rule{{Path: []string{"/cached"}}}}
 	data, _ := json.Marshal(rf)
-	os.WriteFile(filepath.Join(cacheDir, "ipban_remote_rules.json"), data, 0644)
+	// Compute the expected cache path
+	h := sha256.Sum256([]byte(unreachableURL))
+	cacheName := fmt.Sprintf("ipban_remote_rules_%x.json", h[:8])
+	os.WriteFile(filepath.Join(cacheDir, cacheName), data, 0644)
 
 	// Use an unreachable URL — should fall back to cache
-	rm, err := NewRuleManager("", "http://127.0.0.1:1/unreachable", cacheDir, time.Hour, zap.NewNop())
+	rm, err := NewRuleManager("", unreachableURL, cacheDir, time.Hour, zap.NewNop())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,10 +260,10 @@ func TestStore(t *testing.T) {
 
 func TestClientIP(t *testing.T) {
 	tests := []struct {
-		name       string
-		remoteAddr string
+		name        string
+		remoteAddr  string
 		clientIPVar string // simulates Caddy's client_ip var
-		want       string
+		want        string
 	}{
 		{"remote only", "192.168.1.1:1234", "", "192.168.1.1"},
 		{"remote no port", "192.168.1.1", "", "192.168.1.1"},
@@ -299,8 +305,10 @@ func TestIsPublicIP(t *testing.T) {
 		{"invalid", false},
 	}
 	for _, tt := range tests {
-		if got := isPublicIP(tt.ip); got != tt.want {
-			t.Errorf("isPublicIP(%q) = %v, want %v", tt.ip, got, tt.want)
+		ip := net.ParseIP(tt.ip)
+		got := ip != nil && isPublicIPParsed(ip)
+		if got != tt.want {
+			t.Errorf("isPublicIPParsed(%q) = %v, want %v", tt.ip, got, tt.want)
 		}
 	}
 }
@@ -322,13 +330,13 @@ func TestAllowlist(t *testing.T) {
 		m.allowNets = append(m.allowNets, n)
 	}
 
-	if !m.isAllowed("8.8.8.1") {
+	if !m.isAllowedParsed(net.ParseIP("8.8.8.1")) {
 		t.Error("8.8.8.1 should be allowed (in 8.8.8.0/24)")
 	}
-	if !m.isAllowed("1.2.3.4") {
+	if !m.isAllowedParsed(net.ParseIP("1.2.3.4")) {
 		t.Error("1.2.3.4 should be allowed (exact match)")
 	}
-	if m.isAllowed("9.9.9.9") {
+	if m.isAllowedParsed(net.ParseIP("9.9.9.9")) {
 		t.Error("9.9.9.9 should not be allowed")
 	}
 }
@@ -415,12 +423,13 @@ func newTestIPBan(t *testing.T) *IPBan {
 	}
 	store, _ := NewStore("", nil)
 	return &IPBan{
-		StatusCodes: []int{403},
-		Threshold:   1,
-		ruleMgr:     rm,
-		store:       store,
-		ipset:       NewIPSet(""),
-		logger:      zap.NewNop(),
+		StatusCodes:  []int{403},
+		statusBodies: [][]byte{[]byte(http.StatusText(403))},
+		Threshold:    1,
+		ruleMgr:      rm,
+		store:        store,
+		ipset:        NewIPSet(""),
+		logger:       zap.NewNop(),
 	}
 }
 
