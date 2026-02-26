@@ -32,8 +32,6 @@ type Rule struct {
 	UserAgentKeyword []string `json:"user_agent_keyword,omitempty"`
 	// UserAgentRegex matches User-Agent against regular expressions.
 	UserAgentRegex []string `json:"user_agent_regex,omitempty"`
-	// Invert negates the match result.
-	Invert bool `json:"invert,omitempty"`
 }
 
 // compiledRule is a Rule with pre-compiled regexes and pre-lowercased patterns.
@@ -88,24 +86,16 @@ func compileRule(r Rule) (*compiledRule, error) {
 }
 
 func (cr *compiledRule) matchRequest(lowerPath, lowerUA, origPath, origUA string) bool {
-	matched := cr.matchInner(lowerPath, lowerUA, origPath, origUA)
-	if cr.rule.Invert {
-		return !matched
-	}
-	return matched
-}
-
-func (cr *compiledRule) matchInner(lp, lua, origPath, origUA string) bool {
-	if cr.pathMap[lp] {
+	if cr.pathMap[lowerPath] {
 		return true
 	}
 	for _, p := range cr.pathPrefixLower {
-		if strings.HasPrefix(lp, p) {
+		if strings.HasPrefix(lowerPath, p) {
 			return true
 		}
 	}
 	for _, kw := range cr.pathKeywordLower {
-		if strings.Contains(lp, kw) {
+		if strings.Contains(lowerPath, kw) {
 			return true
 		}
 	}
@@ -116,7 +106,7 @@ func (cr *compiledRule) matchInner(lp, lua, origPath, origUA string) bool {
 	}
 	if origUA != "" {
 		for _, kw := range cr.uaKeywordLower {
-			if strings.Contains(lua, kw) {
+			if strings.Contains(lowerUA, kw) {
 				return true
 			}
 		}

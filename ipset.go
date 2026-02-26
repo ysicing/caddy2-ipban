@@ -44,6 +44,17 @@ func (s *IPSet) Add(ip string) error {
 	return exec.Command("ipset", "add", s.name, ip, "-exist").Run()
 }
 
+// Del removes an IP from the set. No-op if ipset is unavailable.
+func (s *IPSet) Del(ip string) error {
+	if !s.available {
+		return nil
+	}
+	if net.ParseIP(ip) == nil {
+		return fmt.Errorf("ipset: invalid IP %q", ip)
+	}
+	return exec.Command("ipset", "del", s.name, ip, "-exist").Run()
+}
+
 func (s *IPSet) init() bool {
 	if _, err := exec.LookPath("ipset"); err != nil {
 		return false

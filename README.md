@@ -69,8 +69,7 @@ JSON 格式，灵感来自 sing-box：
       "path_keyword": ["passwd", "phpinfo"],
       "path_regex": ["\\.php\\d?$"],
       "user_agent_keyword": ["sqlmap", "nikto"],
-      "user_agent_regex": ["python-requests/\\d"],
-      "invert": false
+      "user_agent_regex": ["python-requests/\\d"]
     }
   ]
 }

@@ -34,13 +34,14 @@ const maxHitEntries = 100000
 // Store manages banned IPs with optional file persistence.
 // Shared across sites via UsagePool — a malicious IP banned on one site is banned everywhere.
 type Store struct {
-	mu        sync.RWMutex
-	records   map[string]*BanRecord
-	hits      map[string]*hitRecord
-	filePath  string
-	saveTimer *time.Timer
-	logger    *zap.Logger
-	cancel    context.CancelFunc
+	mu             sync.RWMutex
+	records        map[string]*BanRecord
+	hits           map[string]*hitRecord
+	filePath       string
+	saveTimer      *time.Timer
+	logger         *zap.Logger
+	cancel         context.CancelFunc
+	hitsFullLogged bool // log once when hits map is full
 }
 
 // NewStore creates a store, loading persisted data if filePath is set.
@@ -95,6 +96,37 @@ func (s *Store) Ban(ip, reason, host string, duration time.Duration) {
 	s.debounceSave()
 }
 
+// Unban removes an IP from the ban list and clears its hit counter.
+// Returns true if the IP was actually banned.
+func (s *Store) Unban(ip string) bool {
+	s.mu.Lock()
+	_, ok := s.records[ip]
+	if ok {
+		delete(s.records, ip)
+	}
+	delete(s.hits, ip)
+	if ok {
+		s.debounceSave()
+	}
+	s.mu.Unlock()
+	return ok
+}
+
+// ListBanned returns all currently active (non-expired) ban records.
+func (s *Store) ListBanned() []*BanRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	now := time.Now()
+	result := make([]*BanRecord, 0, len(s.records))
+	for _, r := range s.records {
+		if r.ExpiresAt != nil && now.After(*r.ExpiresAt) {
+			continue
+		}
+		result = append(result, r)
+	}
+	return result
+}
+
 // debounceSave schedules a debounced save. Must be called while holding s.mu.Lock().
 func (s *Store) debounceSave() {
 	if s.filePath == "" {
@@ -120,8 +152,13 @@ func (s *Store) RecordHit(ip string, window time.Duration) int {
 	h, ok := s.hits[ip]
 	if !ok || now.Sub(h.firstHit) > h.window {
 		// Prevent unbounded growth from distributed scanning attacks.
-		// When full, silently drop new entries to avoid false-positive bans.
+		// When full, drop new entries to avoid false-positive bans.
 		if !ok && len(s.hits) >= maxHitEntries {
+			if !s.hitsFullLogged && s.logger != nil {
+				s.logger.Warn("hit tracking table full, new IPs will not be tracked",
+					zap.Int("limit", maxHitEntries))
+				s.hitsFullLogged = true
+			}
 			return 0
 		}
 		s.hits[ip] = &hitRecord{count: 1, firstHit: now, window: window}
@@ -168,11 +205,14 @@ func (s *Store) Cleanup() {
 // Uses its own context because Store is shared via UsagePool — its lifecycle is
 // managed by reference counting, not by any single module's context.
 func (s *Store) StartCleanup(interval time.Duration) {
+	s.mu.Lock()
 	if s.cancel != nil {
+		s.mu.Unlock()
 		return // already started
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
+	s.mu.Unlock()
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()

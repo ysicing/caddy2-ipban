@@ -34,7 +34,7 @@ Private/loopback IPs and allowlisted IPs are skipped. Blocked requests get a ran
 
 - **IPBan** (`ipban.go`) — Caddy module entry point. Implements `caddyhttp.MiddlewareHandler`. Wires together RuleManager, Store, and IPSet. Registers the `ipban` Caddyfile directive.
 - **RuleManager** (`rule_manager.go`) — Manages rule lifecycle. Loads from local file and/or remote URL, merges both sources. Local file watched via fsnotify with 500ms debounce. Remote URL refreshed on interval using ETag conditional requests (`If-None-Match` / 304). Remote rules cached locally for offline startup fallback.
-- **Rules** (`rules.go`) — Rule JSON format definition (sing-box inspired), compiled rule matching, and HTTP fetch logic. Rules support: `path`, `path_prefix`, `path_keyword`, `path_regex`, `user_agent_keyword`, `user_agent_regex`, `invert`.
+- **Rules** (`rules.go`) — Rule JSON format definition (sing-box inspired), compiled rule matching, and HTTP fetch logic. Rules support: `path`, `path_prefix`, `path_keyword`, `path_regex`, `user_agent_keyword`, `user_agent_regex`.
 - **Store** (`store.go`) — In-memory banned IP map with `sync.RWMutex`. Supports TTL-based expiry, periodic cleanup, JSON file persistence, and hit counting for threshold-based banning.
 - **IPSet** (`ipset.go`) — Wraps Linux `ipset` CLI. Gracefully degrades when unavailable (macOS, no permissions).
 - **Defaults** (`defaults.go`) — Built-in `RuleFile` used when no rule_source is configured.
@@ -64,7 +64,7 @@ This project follows Caddy module development conventions:
 
 ```
 rule_source, refresh_interval,
-ipset_name, persist_file, status_codes, ban_duration,
+status_codes, ban_duration,
 allow, threshold, threshold_window
 ```
 
@@ -75,7 +75,7 @@ allow, threshold, threshold_window
   "version": 1,
   "rules": [{ "path": [], "path_prefix": [], "path_keyword": [],
                "path_regex": [], "user_agent_keyword": [],
-               "user_agent_regex": [], "invert": false }]
+               "user_agent_regex": [] }]
 }
 ```
 

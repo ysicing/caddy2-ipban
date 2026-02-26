@@ -78,17 +78,6 @@ func TestCompiledRuleRegex(t *testing.T) {
 	}
 }
 
-func TestCompiledRuleInvert(t *testing.T) {
-	r := Rule{Path: []string{"/health"}, Invert: true}
-	cr, _ := compileRule(r)
-	if cr.matchRequest(strings.ToLower("/health"), "", "/health", "") {
-		t.Error("/health should NOT match (inverted)")
-	}
-	if !cr.matchRequest(strings.ToLower("/other"), "", "/other", "") {
-		t.Error("/other should match (inverted)")
-	}
-}
-
 func TestRuleManagerLocalFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "rules.json")

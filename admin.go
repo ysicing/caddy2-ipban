@@ -1,0 +1,118 @@
+package ipban
+
+import (
+	"encoding/json"
+	"net"
+	"net/http"
+	"sync"
+
+	"github.com/caddyserver/caddy/v2"
+)
+
+var (
+	activeStore    *Store
+	activeIPSet    *IPSet
+	activeGlobalMu sync.RWMutex
+)
+
+func init() {
+	caddy.RegisterModule(AdminAPI{})
+}
+
+// AdminAPI provides admin endpoints for managing banned IPs.
+//
+// Endpoints:
+//
+//	GET  /ipban/banned  — list all currently banned IPs
+//	POST /ipban/unban   — unban an IP: {"ip": "1.2.3.4"}
+type AdminAPI struct{}
+
+func (AdminAPI) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  "admin.api.ipban",
+		New: func() caddy.Module { return new(AdminAPI) },
+	}
+}
+
+func (a AdminAPI) Routes() []caddy.AdminRoute {
+	return []caddy.AdminRoute{
+		{Pattern: "/ipban/banned", Handler: caddy.AdminHandlerFunc(a.handleList)},
+		{Pattern: "/ipban/unban", Handler: caddy.AdminHandlerFunc(a.handleUnban)},
+	}
+}
+
+func (a AdminAPI) handleList(w http.ResponseWriter, r *http.Request) error {
+	if r.Method != http.MethodGet {
+		return caddy.APIError{HTTPStatus: http.StatusMethodNotAllowed, Message: "method not allowed"}
+	}
+	store := getStore()
+	if store == nil {
+		return caddy.APIError{HTTPStatus: http.StatusServiceUnavailable, Message: "ipban not active"}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(store.ListBanned())
+}
+
+func (a AdminAPI) handleUnban(w http.ResponseWriter, r *http.Request) error {
+	if r.Method != http.MethodPost {
+		return caddy.APIError{HTTPStatus: http.StatusMethodNotAllowed, Message: "method not allowed"}
+	}
+	store := getStore()
+	if store == nil {
+		return caddy.APIError{HTTPStatus: http.StatusServiceUnavailable, Message: "ipban not active"}
+	}
+
+	var req struct {
+		IP string `json:"ip"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		return caddy.APIError{HTTPStatus: http.StatusBadRequest, Message: "invalid JSON body"}
+	}
+	if net.ParseIP(req.IP) == nil {
+		return caddy.APIError{HTTPStatus: http.StatusBadRequest, Message: "invalid IP address"}
+	}
+
+	if !store.Unban(req.IP) {
+		return caddy.APIError{HTTPStatus: http.StatusNotFound, Message: "ip not banned"}
+	}
+
+	// Best-effort ipset removal.
+	if ipset := getIPSet(); ipset != nil {
+		_ = ipset.Del(req.IP)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"message":"unbanned"}`))
+	return nil
+}
+
+func getStore() *Store {
+	activeGlobalMu.RLock()
+	defer activeGlobalMu.RUnlock()
+	return activeStore
+}
+
+func getIPSet() *IPSet {
+	activeGlobalMu.RLock()
+	defer activeGlobalMu.RUnlock()
+	return activeIPSet
+}
+
+func setActiveStore(s *Store) {
+	activeGlobalMu.Lock()
+	activeStore = s
+	if s == nil {
+		activeIPSet = nil
+	}
+	activeGlobalMu.Unlock()
+}
+
+func setActiveIPSet(ipset *IPSet) {
+	activeGlobalMu.Lock()
+	activeIPSet = ipset
+	activeGlobalMu.Unlock()
+}
+
+// Interface guard
+var _ caddy.AdminRouter = AdminAPI{}

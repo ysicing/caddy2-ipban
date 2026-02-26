@@ -23,7 +23,7 @@ var defaultRuleFile = RuleFile{
 			PathPrefix: []string{
 				"/.env.", "/.git/", "/.svn/",
 				"/wp-admin/", "/wp-content/uploads/", "/wp-includes/",
-				"/phpmyadmin", "/pma/", "/myadmin/",
+				"/phpmyadmin", "/myadmin/",
 				"/cgi-bin/",
 				"/actuator/", "/jmx-console/",
 				"/manager/html", "/manager/status",
@@ -44,6 +44,8 @@ var defaultRuleFile = RuleFile{
 				"xray", "crawlergo", "httpx", "subfinder",
 				"censys", "shodan", "netcraft",
 				"scanner", "exploit",
+				"python-requests",
+				"go-http-client",
 			},
 		},
 	},

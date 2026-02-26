@@ -16,7 +16,7 @@ No linter or Makefile — use standard `go` commands only.
 Single Go package. Request flow: `ServeHTTP → clientIP → isPublicIP? → isAllowed? → Store.IsBanned? → RuleManager.Match? → threshold check → ban+block / next`.
 - **ipban.go** — Caddy module entry; wires RuleManager, Store, IPSet.
 - **rule_manager.go** — Loads/watches local file (fsnotify) and remote URL (ETag/304); `sync.RWMutex` for concurrency.
-- **rules.go** — Rule JSON schema (sing-box inspired), compiled matching (path, path_prefix, path_keyword, path_regex, user_agent_keyword, user_agent_regex, invert).
+- **rules.go** — Rule JSON schema (sing-box inspired), compiled matching (path, path_prefix, path_keyword, path_regex, user_agent_keyword, user_agent_regex).
 - **store.go** — In-memory banned-IP map with TTL expiry and optional JSON persistence; own `sync.RWMutex`.
 - **ipset.go** — Linux `ipset` CLI wrapper; gracefully degrades on macOS/no perms.
 - **defaults.go** — Built-in rules when no rule_file/rule_url configured.

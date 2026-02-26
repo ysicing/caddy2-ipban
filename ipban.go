@@ -156,11 +156,22 @@ func (m *IPBan) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("ipban: init store: %w", err)
 	}
 	m.store = storeVal.(*Store)
+	setActiveStore(m.store)
 
 	m.ipset = NewIPSet(m.IPSetName)
+	setActiveIPSet(m.ipset)
 	if m.IPSetName != "" && !m.ipset.Available() {
 		m.logger.Warn("ipset not available, using in-process blocking only",
 			zap.String("ipset_name", m.IPSetName))
+	}
+
+	// Restore persisted bans into ipset after reboot/reload.
+	if m.ipset.Available() {
+		for _, r := range m.store.ListBanned() {
+			if err := m.ipset.Add(r.IP); err != nil {
+				m.logger.Warn("ipset restore failed", zap.String("ip", r.IP), zap.Error(err))
+			}
+		}
 	}
 
 	src := "defaults"
@@ -217,7 +228,11 @@ func (m *IPBan) Cleanup() error {
 	if m.ruleKey != "" {
 		_, _ = rulePool.Delete(m.ruleKey)
 	}
-	_, _ = storePool.Delete("store")
+	deleted, _ := storePool.Delete("store")
+	if deleted {
+		setActiveStore(nil)
+		setActiveIPSet(nil)
+	}
 	return nil
 }
 
