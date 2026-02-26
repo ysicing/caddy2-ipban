@@ -31,7 +31,6 @@ var defaultRuleFile = RuleFile{
 				"/debug/pprof", "/debug/vars",
 				"/telescope/", "/vendor/phpunit",
 				"/etc/passwd", "/etc/shadow", "/proc/self/",
-				"/api/v1/pods", "/api/v1/namespaces",
 			},
 			PathKeyword: []string{
 				"wp-config", "phpinfo",

@@ -25,17 +25,17 @@ No linter is configured. No Makefile — standard `go` commands only.
 ### Request Flow
 
 ```
-ServeHTTP → clientIP(r) → store.IsBanned? → ruleMgr.Match(path, ua)? → ban + block / next
+ServeHTTP → clientIP(r) → isPublicIP? → isAllowed? → store.IsBanned? → ruleMgr.Match? → threshold check → ban + block / next
 ```
 
-Blocked requests get a random 4xx status code. Banned IPs are stored in-memory (Store) and optionally added to Linux ipset.
+Private/loopback IPs and allowlisted IPs are skipped. Blocked requests get a random 4xx status code. Banning respects the threshold (N hits within a window before banning). Banned IPs are stored in-memory (Store) and optionally added to Linux ipset.
 
 ### Key Components
 
 - **IPBan** (`ipban.go`) — Caddy module entry point. Implements `caddyhttp.MiddlewareHandler`. Wires together RuleManager, Store, and IPSet. Registers the `ipban` Caddyfile directive.
 - **RuleManager** (`rule_manager.go`) — Manages rule lifecycle. Loads from local file and/or remote URL, merges both sources. Local file watched via fsnotify with 500ms debounce. Remote URL refreshed on interval using ETag conditional requests (`If-None-Match` / 304). Remote rules cached locally for offline startup fallback.
 - **Rules** (`rules.go`) — Rule JSON format definition (sing-box inspired), compiled rule matching, and HTTP fetch logic. Rules support: `path`, `path_prefix`, `path_keyword`, `path_regex`, `user_agent_keyword`, `user_agent_regex`, `invert`.
-- **Store** (`store.go`) — In-memory banned IP map with `sync.RWMutex`. Supports TTL-based expiry, periodic cleanup, and JSON file persistence.
+- **Store** (`store.go`) — In-memory banned IP map with `sync.RWMutex`. Supports TTL-based expiry, periodic cleanup, JSON file persistence, and hit counting for threshold-based banning.
 - **IPSet** (`ipset.go`) — Wraps Linux `ipset` CLI. Gracefully degrades when unavailable (macOS, no permissions).
 - **Defaults** (`defaults.go`) — Built-in `RuleFile` used when no rule_file/rule_url is configured.
 - **Caddyfile** (`caddyfile.go`) — Caddyfile unmarshaling and interface guards.
@@ -64,7 +64,8 @@ This project follows Caddy module development conventions:
 
 ```
 rule_file, rule_url, refresh_interval, cache_dir,
-ipset_name, persist_file, status_codes, ban_duration
+ipset_name, persist_file, status_codes, ban_duration,
+allow, threshold, threshold_window
 ```
 
 ## Rule JSON Format

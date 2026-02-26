@@ -1,0 +1,33 @@
+{
+	order ipban first
+}
+
+example.com {
+	ipban {
+		# Rule sources (omit both to use built-in defaults)
+		rule_file /etc/caddy/rules.json
+		rule_url  https://example.com/rules.json
+		refresh_interval 1h
+		cache_dir /var/lib/caddy/ipban
+
+		# Allowlist: public IPs/CIDRs that should never be banned
+		# (private/loopback IPs are always skipped automatically)
+		allow 198.51.100.0/24 203.0.113.50
+
+		# Threshold: require 3 malicious hits within 1h before banning
+		threshold 3
+		threshold_window 1h
+
+		# Ban duration (0 = permanent)
+		ban_duration 24h
+
+		# Random status codes returned to blocked requests
+		status_codes 400 403 404 429
+
+		# Optional: persist bans to disk (survive restarts)
+		persist_file /var/lib/caddy/ipban_bans.json
+
+		# Optional: Linux ipset kernel-level blocking
+		# ipset_name blacklist
+	}
+}

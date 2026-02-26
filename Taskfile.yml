@@ -1,0 +1,49 @@
+version: "3"
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list-all
+
+  build:
+    desc: Build caddy with ipban plugin via xcaddy
+    cmds:
+      - xcaddy build --with github.com/ysicing/caddy2-ipban=.
+
+  test:
+    desc: Run all tests
+    cmds:
+      - go test -count=1 ./...
+
+  test:race:
+    desc: Run tests with race detector
+    cmds:
+      - go test -race -count=1 ./...
+
+  test:verbose:
+    desc: Run tests with verbose output
+    cmds:
+      - go test -v -count=1 ./...
+
+  vet:
+    desc: Run static analysis
+    cmds:
+      - go vet ./...
+
+  lint:
+    desc: Run all checks (vet + test + race)
+    cmds:
+      - task: vet
+      - task: test:race
+
+  tidy:
+    desc: Tidy go modules
+    cmds:
+      - go mod tidy
+
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - rm -f caddy
+      - go clean -cache -testcache

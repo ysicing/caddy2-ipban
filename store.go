@@ -3,9 +3,13 @@ package ipban
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 // BanRecord represents a single banned IP entry.
@@ -16,19 +20,34 @@ type BanRecord struct {
 	ExpiresAt time.Time `json:"expires_at,omitempty"`
 }
 
+// hitRecord tracks malicious request counts for threshold-based banning.
+type hitRecord struct {
+	count    int
+	firstHit time.Time
+	window   time.Duration
+}
+
+// maxHitEntries limits the hits map size to prevent memory exhaustion
+// from distributed scanning attacks using many unique source IPs.
+const maxHitEntries = 100000
+
 // Store manages banned IPs with optional file persistence.
 type Store struct {
 	mu        sync.RWMutex
 	records   map[string]*BanRecord
+	hits      map[string]*hitRecord
 	filePath  string
 	saveTimer *time.Timer
+	logger    *zap.Logger
 }
 
 // NewStore creates a store, loading persisted data if filePath is set.
-func NewStore(filePath string) (*Store, error) {
+func NewStore(filePath string, logger *zap.Logger) (*Store, error) {
 	s := &Store{
 		records:  make(map[string]*BanRecord),
+		hits:     make(map[string]*hitRecord),
 		filePath: filePath,
+		logger:   logger,
 	}
 	if filePath != "" {
 		if err := s.load(); err != nil && !os.IsNotExist(err) {
@@ -82,8 +101,37 @@ func (s *Store) debounceSave() {
 		s.saveTimer.Stop()
 	}
 	s.saveTimer = time.AfterFunc(time.Second, func() {
-		_ = s.save()
+		if err := s.save(); err != nil && s.logger != nil {
+			s.logger.Warn("persist save failed", zap.Error(err))
+		}
 	})
+}
+
+// RecordHit increments the hit counter for an IP within a sliding window.
+// Returns the current count. If the window has elapsed, the counter resets.
+func (s *Store) RecordHit(ip string, window time.Duration) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	h, ok := s.hits[ip]
+	if !ok || now.Sub(h.firstHit) > h.window {
+		// Prevent unbounded growth from distributed scanning attacks.
+		if !ok && len(s.hits) >= maxHitEntries {
+			return math.MaxInt
+		}
+		s.hits[ip] = &hitRecord{count: 1, firstHit: now, window: window}
+		return 1
+	}
+	h.count++
+	return h.count
+}
+
+// ClearHits removes the hit counter for an IP (called after banning).
+func (s *Store) ClearHits(ip string) {
+	s.mu.Lock()
+	delete(s.hits, ip)
+	s.mu.Unlock()
 }
 
 // Cleanup removes expired entries and persists the result.
@@ -98,10 +146,17 @@ func (s *Store) Cleanup() {
 			delete(s.records, ip)
 		}
 	}
+	for ip, h := range s.hits {
+		if now.Sub(h.firstHit) > h.window {
+			delete(s.hits, ip)
+		}
+	}
 	s.mu.Unlock()
 
 	if s.filePath != "" {
-		_ = s.save()
+		if err := s.save(); err != nil && s.logger != nil {
+			s.logger.Warn("cleanup persist save failed", zap.Error(err))
+		}
 	}
 }
 
@@ -157,14 +212,35 @@ func (s *Store) save() error {
 	if err != nil {
 		return err
 	}
-	return atomicWriteFile(s.filePath, data, 0644)
+	return atomicWriteFile(s.filePath, data, 0600)
 }
 
 // atomicWriteFile writes data to a temp file then renames it into place,
 // preventing corruption on crash or partial write.
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, perm); err != nil {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp.*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Chmod(perm); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, path)

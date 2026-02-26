@@ -3,13 +3,16 @@ package ipban
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
 )
@@ -44,7 +47,9 @@ func TestCompiledRuleMatch(t *testing.T) {
 		{"/anything", "Mozilla/5.0 (Windows)", false},
 	}
 	for _, tt := range tests {
-		if got := cr.matchRequest(tt.path, tt.ua); got != tt.want {
+		lp := strings.ToLower(tt.path)
+		lua := strings.ToLower(tt.ua)
+		if got := cr.matchRequest(lp, lua, tt.path, tt.ua); got != tt.want {
 			t.Errorf("match(%q, %q) = %v, want %v", tt.path, tt.ua, got, tt.want)
 		}
 	}
@@ -59,16 +64,16 @@ func TestCompiledRuleRegex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cr.matchRequest("/test.php", "") {
+	if !cr.matchRequest(strings.ToLower("/test.php"), "", "/test.php", "") {
 		t.Error("should match .php path")
 	}
-	if !cr.matchRequest("/test.php5", "") {
+	if !cr.matchRequest(strings.ToLower("/test.php5"), "", "/test.php5", "") {
 		t.Error("should match .php5 path")
 	}
-	if cr.matchRequest("/test.html", "") {
+	if cr.matchRequest(strings.ToLower("/test.html"), "", "/test.html", "") {
 		t.Error("should not match .html path")
 	}
-	if !cr.matchRequest("/ok", "Python-Requests/2.28") {
+	if !cr.matchRequest(strings.ToLower("/ok"), strings.ToLower("Python-Requests/2.28"), "/ok", "Python-Requests/2.28") {
 		t.Error("should match python-requests UA")
 	}
 }
@@ -76,10 +81,10 @@ func TestCompiledRuleRegex(t *testing.T) {
 func TestCompiledRuleInvert(t *testing.T) {
 	r := Rule{Path: []string{"/health"}, Invert: true}
 	cr, _ := compileRule(r)
-	if cr.matchRequest("/health", "") {
+	if cr.matchRequest(strings.ToLower("/health"), "", "/health", "") {
 		t.Error("/health should NOT match (inverted)")
 	}
-	if !cr.matchRequest("/other", "") {
+	if !cr.matchRequest(strings.ToLower("/other"), "", "/other", "") {
 		t.Error("/other should match (inverted)")
 	}
 }
@@ -191,7 +196,7 @@ func TestRuleManagerRemoteWithETag(t *testing.T) {
 	}
 
 	// Second fetch should get 304 (ETag match)
-	result, err := fetchFromURL(srv.URL, etag)
+	result, err := fetchFromURL(context.Background(), srv.URL, etag)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +226,7 @@ func TestRuleManagerCacheFallback(t *testing.T) {
 
 func TestStore(t *testing.T) {
 	t.Run("ban and check", func(t *testing.T) {
-		s, _ := NewStore("")
+		s, _ := NewStore("", nil)
 		if s.IsBanned("1.2.3.4") {
 			t.Error("should not be banned initially")
 		}
@@ -232,7 +237,7 @@ func TestStore(t *testing.T) {
 	})
 
 	t.Run("ban with expiry", func(t *testing.T) {
-		s, _ := NewStore("")
+		s, _ := NewStore("", nil)
 		s.Ban("1.2.3.4", "test", 1*time.Millisecond)
 		time.Sleep(5 * time.Millisecond)
 		if s.IsBanned("1.2.3.4") {
@@ -243,12 +248,12 @@ func TestStore(t *testing.T) {
 	t.Run("persistence", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "bans.json")
-		s1, _ := NewStore(path)
+		s1, _ := NewStore(path, nil)
 		s1.Ban("10.0.0.1", "test", 0)
 		// Wait for debounced save to complete
 		time.Sleep(2 * time.Second)
 
-		s2, err := NewStore(path)
+		s2, err := NewStore(path, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -286,13 +291,140 @@ func TestClientIP(t *testing.T) {
 	}
 }
 
+func TestIsPublicIP(t *testing.T) {
+	tests := []struct {
+		ip   string
+		want bool
+	}{
+		{"8.8.8.8", true},
+		{"1.1.1.1", true},
+		{"192.168.1.1", false},
+		{"10.0.0.1", false},
+		{"172.16.0.1", false},
+		{"127.0.0.1", false},
+		{"::1", false},
+		{"fe80::1", false},
+		{"2001:db8::1", true}, // documentation range, not flagged by IsPrivate
+		{"2400:cb00::1", true},
+		{"0.0.0.0", false},
+		{"invalid", false},
+	}
+	for _, tt := range tests {
+		if got := isPublicIP(tt.ip); got != tt.want {
+			t.Errorf("isPublicIP(%q) = %v, want %v", tt.ip, got, tt.want)
+		}
+	}
+}
+
+func TestAllowlist(t *testing.T) {
+	m := newTestIPBan(t)
+	m.Allowlist = []string{"8.8.8.0/24", "1.2.3.4"}
+	// Parse allowlist like Provision does
+	for _, entry := range m.Allowlist {
+		_, n, err := net.ParseCIDR(entry)
+		if err != nil {
+			ip := net.ParseIP(entry)
+			bits := 32
+			if ip.To4() == nil {
+				bits = 128
+			}
+			n = &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}
+		}
+		m.allowNets = append(m.allowNets, n)
+	}
+
+	if !m.isAllowed("8.8.8.1") {
+		t.Error("8.8.8.1 should be allowed (in 8.8.8.0/24)")
+	}
+	if !m.isAllowed("1.2.3.4") {
+		t.Error("1.2.3.4 should be allowed (exact match)")
+	}
+	if m.isAllowed("9.9.9.9") {
+		t.Error("9.9.9.9 should not be allowed")
+	}
+}
+
+func TestServeHTTP_SkipsPrivateIP(t *testing.T) {
+	m := newTestIPBan(t)
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.WriteHeader(200)
+		return nil
+	})
+	// Private IP accessing malicious path should pass through
+	r := httptest.NewRequest("GET", "/.env", nil)
+	r.RemoteAddr = "192.168.1.1:5678"
+	w := httptest.NewRecorder()
+	_ = m.ServeHTTP(w, r, next)
+	if w.Code != 200 {
+		t.Errorf("private IP should pass through, got %d", w.Code)
+	}
+}
+
+func TestThreshold(t *testing.T) {
+	m := newTestIPBan(t)
+	m.Threshold = 3
+	m.ThresholdWindow = caddy.Duration(1 * time.Hour)
+
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.WriteHeader(200)
+		return nil
+	})
+
+	ip := "203.0.113.1" // public IP from TEST-NET-3
+
+	// First two hits should block but NOT ban
+	for i := 0; i < 2; i++ {
+		r := httptest.NewRequest("GET", "/.env", nil)
+		r.RemoteAddr = ip + ":5678"
+		w := httptest.NewRecorder()
+		_ = m.ServeHTTP(w, r, next)
+		if w.Code != 403 {
+			t.Errorf("hit %d: expected 403, got %d", i+1, w.Code)
+		}
+		if m.store.IsBanned(ip) {
+			t.Errorf("hit %d: should NOT be banned yet", i+1)
+		}
+	}
+
+	// Third hit should trigger the ban
+	r := httptest.NewRequest("GET", "/.env", nil)
+	r.RemoteAddr = ip + ":5678"
+	w := httptest.NewRecorder()
+	_ = m.ServeHTTP(w, r, next)
+	if w.Code != 403 {
+		t.Errorf("hit 3: expected 403, got %d", w.Code)
+	}
+	if !m.store.IsBanned(ip) {
+		t.Error("hit 3: should be banned now")
+	}
+}
+
+func TestStoreRecordHit(t *testing.T) {
+	s, _ := NewStore("", nil)
+
+	if c := s.RecordHit("1.2.3.4", time.Hour); c != 1 {
+		t.Errorf("first hit = %d, want 1", c)
+	}
+	if c := s.RecordHit("1.2.3.4", time.Hour); c != 2 {
+		t.Errorf("second hit = %d, want 2", c)
+	}
+
+	// Window expiry
+	s2, _ := NewStore("", nil)
+	s2.RecordHit("1.2.3.4", 1*time.Millisecond)
+	time.Sleep(5 * time.Millisecond)
+	if c := s2.RecordHit("1.2.3.4", 1*time.Millisecond); c != 1 {
+		t.Errorf("after window expiry = %d, want 1", c)
+	}
+}
+
 func newTestIPBan(t *testing.T) *IPBan {
 	t.Helper()
 	rm, err := NewRuleManager("", "", "", time.Hour, zap.NewNop())
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, _ := NewStore("")
+	store, _ := NewStore("", nil)
 	return &IPBan{
 		StatusCodes: []int{403},
 		ruleMgr:     rm,

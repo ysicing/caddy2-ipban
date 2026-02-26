@@ -52,12 +52,19 @@ type IPBan struct {
 	StatusCodes []int `json:"status_codes,omitempty"`
 	// BanDuration is how long an IP stays banned. 0 = permanent.
 	BanDuration caddy.Duration `json:"ban_duration,omitempty"`
+	// Allowlist is a list of IPs or CIDRs that are never banned.
+	Allowlist []string `json:"allowlist,omitempty"`
+	// Threshold is the number of malicious hits before banning. Default: 1.
+	Threshold int `json:"threshold,omitempty"`
+	// ThresholdWindow is the time window for counting hits. Default: 1h.
+	ThresholdWindow caddy.Duration `json:"threshold_window,omitempty"`
 
-	ruleMgr *RuleManager
-	store   *Store
-	ipset   *IPSet
-	logger  *zap.Logger
-	ruleKey string // key for shared RuleManager pool
+	ruleMgr   *RuleManager
+	store     *Store
+	ipset     *IPSet
+	logger    *zap.Logger
+	ruleKey   string // key for shared RuleManager pool
+	allowNets []*net.IPNet
 }
 
 // rulePool allows multiple sites with identical rule configs to share
@@ -78,6 +85,28 @@ func (m *IPBan) Provision(ctx caddy.Context) error {
 
 	if len(m.StatusCodes) == 0 {
 		m.StatusCodes = []int{400, 403, 404, 429}
+	}
+	if m.Threshold <= 0 {
+		m.Threshold = 1
+	}
+	if time.Duration(m.ThresholdWindow) == 0 {
+		m.ThresholdWindow = caddy.Duration(1 * time.Hour)
+	}
+
+	for _, entry := range m.Allowlist {
+		_, n, err := net.ParseCIDR(entry)
+		if err != nil {
+			ip := net.ParseIP(entry)
+			if ip == nil {
+				return fmt.Errorf("ipban: invalid allowlist entry %q", entry)
+			}
+			bits := 32
+			if ip.To4() == nil {
+				bits = 128
+			}
+			n = &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}
+		}
+		m.allowNets = append(m.allowNets, n)
 	}
 
 	interval := time.Duration(m.RefreshInterval)
@@ -101,13 +130,13 @@ func (m *IPBan) Provision(ctx caddy.Context) error {
 		return rm, nil
 	})
 	if err != nil {
-		return fmt.Errorf("ipban: init rules: %v", err)
+		return fmt.Errorf("ipban: init rules: %w", err)
 	}
 	m.ruleMgr = val.(*RuleManager)
 
-	m.store, err = NewStore(m.PersistFile)
+	m.store, err = NewStore(m.PersistFile, m.logger)
 	if err != nil {
-		return fmt.Errorf("ipban: init store: %v", err)
+		return fmt.Errorf("ipban: init store: %w", err)
 	}
 	m.store.StartCleanup(ctx, 5*time.Minute)
 
@@ -145,13 +174,28 @@ func (m *IPBan) Validate() error {
 func (m *IPBan) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	ip := clientIP(r)
 
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil || !isPublicIPParsed(parsedIP) || m.isAllowedParsed(parsedIP) {
+		return next.ServeHTTP(w, r)
+	}
+
 	if m.store.IsBanned(ip) {
 		return m.block(w)
 	}
 
 	if m.ruleMgr.Match(r.URL.Path, r.UserAgent()) {
-		reason := fmt.Sprintf("path:%s ua:%s", r.URL.Path, r.UserAgent())
-		m.ban(ip, reason)
+		reason := truncatedReason(r.URL.Path, r.UserAgent())
+		if m.Threshold <= 1 {
+			m.ban(ip, reason)
+			return m.block(w)
+		}
+		window := time.Duration(m.ThresholdWindow)
+		count := m.store.RecordHit(ip, window)
+		if count >= m.Threshold {
+			m.ban(ip, reason)
+			m.store.ClearHits(ip)
+			return m.block(w)
+		}
 		return m.block(w)
 	}
 
@@ -187,6 +231,56 @@ func (m *IPBan) block(w http.ResponseWriter) error {
 	w.WriteHeader(code)
 	_, _ = w.Write([]byte(http.StatusText(code)))
 	return nil
+}
+
+// isPublicIP returns true if the IP string is a public (globally routable) address.
+func isPublicIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	return isPublicIPParsed(ip)
+}
+
+// isPublicIPParsed checks a pre-parsed IP to avoid redundant parsing on the hot path.
+func isPublicIPParsed(ip net.IP) bool {
+	return !ip.IsLoopback() && !ip.IsPrivate() && !ip.IsLinkLocalUnicast() &&
+		!ip.IsLinkLocalMulticast() && !ip.IsUnspecified()
+}
+
+// isAllowed checks if the IP matches any allowlist entry.
+func (m *IPBan) isAllowed(ipStr string) bool {
+	if len(m.allowNets) == 0 {
+		return false
+	}
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	return m.isAllowedParsed(ip)
+}
+
+// isAllowedParsed checks a pre-parsed IP against the allowlist.
+func (m *IPBan) isAllowedParsed(ip net.IP) bool {
+	for _, n := range m.allowNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// truncatedReason builds a ban reason string, truncating path and UA to prevent
+// log injection and excessive log/persistence size.
+func truncatedReason(path, ua string) string {
+	const maxLen = 256
+	if len(path) > maxLen {
+		path = path[:maxLen] + "..."
+	}
+	if len(ua) > maxLen {
+		ua = ua[:maxLen] + "..."
+	}
+	return "path:" + path + " ua:" + ua
 }
 
 func clientIP(r *http.Request) string {

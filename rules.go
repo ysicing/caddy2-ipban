@@ -1,6 +1,7 @@
 package ipban
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -86,16 +87,15 @@ func compileRule(r Rule) (*compiledRule, error) {
 	return cr, nil
 }
 
-func (cr *compiledRule) matchRequest(path, ua string) bool {
-	matched := cr.matchInner(path, ua)
+func (cr *compiledRule) matchRequest(lowerPath, lowerUA, origPath, origUA string) bool {
+	matched := cr.matchInner(lowerPath, lowerUA, origPath, origUA)
 	if cr.rule.Invert {
 		return !matched
 	}
 	return matched
 }
 
-func (cr *compiledRule) matchInner(path, ua string) bool {
-	lp := strings.ToLower(path)
+func (cr *compiledRule) matchInner(lp, lua, origPath, origUA string) bool {
 	if cr.pathMap[lp] {
 		return true
 	}
@@ -110,19 +110,18 @@ func (cr *compiledRule) matchInner(path, ua string) bool {
 		}
 	}
 	for _, re := range cr.pathRegex {
-		if re.MatchString(path) {
+		if re.MatchString(origPath) {
 			return true
 		}
 	}
-	if ua != "" {
-		lua := strings.ToLower(ua)
+	if origUA != "" {
 		for _, kw := range cr.uaKeywordLower {
 			if strings.Contains(lua, kw) {
 				return true
 			}
 		}
 		for _, re := range cr.userAgentRegex {
-			if re.MatchString(ua) {
+			if re.MatchString(origUA) {
 				return true
 			}
 		}
@@ -175,8 +174,8 @@ type fetchResult struct {
 var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 // fetchFromURL downloads rules, using ETag for conditional requests.
-func fetchFromURL(url, lastETag string) (*fetchResult, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+func fetchFromURL(ctx context.Context, url, lastETag string) (*fetchResult, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}

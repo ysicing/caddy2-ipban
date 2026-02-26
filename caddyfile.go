@@ -2,6 +2,7 @@ package ipban
 
 import (
 	"strconv"
+	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -19,6 +20,9 @@ import (
 //	    persist_file /var/lib/caddy/ipban.json
 //	    status_codes 400 403 404 429
 //	    ban_duration 24h
+//	    allow 10.0.0.0/8 192.168.0.0/16
+//	    threshold 3
+//	    threshold_window 1h
 //	}
 func (m *IPBan) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume directive name
@@ -76,6 +80,33 @@ func (m *IPBan) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Errf("invalid ban_duration: %s", d.Val())
 			}
 			m.BanDuration = caddy.Duration(dur)
+		case "allow":
+			for d.NextArg() {
+				for _, entry := range strings.Fields(d.Val()) {
+					m.Allowlist = append(m.Allowlist, entry)
+				}
+			}
+			if len(m.Allowlist) == 0 {
+				return d.ArgErr()
+			}
+		case "threshold":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			n, err := strconv.Atoi(d.Val())
+			if err != nil || n < 1 {
+				return d.Errf("invalid threshold: %s", d.Val())
+			}
+			m.Threshold = n
+		case "threshold_window":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("invalid threshold_window: %s", d.Val())
+			}
+			m.ThresholdWindow = caddy.Duration(dur)
 		default:
 			return d.Errf("unknown option: %s", d.Val())
 		}

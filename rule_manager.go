@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -47,7 +48,13 @@ func NewRuleManager(filePath, url, cacheDir string, interval time.Duration, logg
 }
 
 // Start begins background watchers.
+// Uses context.Background() intentionally: RuleManager instances are shared via
+// UsagePool across multiple Caddy modules, so their lifecycle is managed by
+// reference counting (Destruct), not by any single module's context.
 func (rm *RuleManager) Start() {
+	if rm.cancel != nil {
+		return // already started
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	rm.cancel = cancel
 
@@ -91,16 +98,19 @@ func (rm *RuleManager) Destruct() error {
 }
 
 // Match checks if a request matches any loaded rule.
+// Path and UA are lowercased once here to avoid per-rule allocations.
 func (rm *RuleManager) Match(path, ua string) bool {
+	lp := strings.ToLower(path)
+	lua := strings.ToLower(ua)
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
 	for _, cr := range rm.fileRules {
-		if cr.matchRequest(path, ua) {
+		if cr.matchRequest(lp, lua, path, ua) {
 			return true
 		}
 	}
 	for _, cr := range rm.urlRules {
-		if cr.matchRequest(path, ua) {
+		if cr.matchRequest(lp, lua, path, ua) {
 			return true
 		}
 	}
@@ -119,7 +129,7 @@ func (rm *RuleManager) loadAll() error {
 
 	// Load remote rules: try fetch, fall back to cache
 	if rm.url != "" {
-		result, err := fetchFromURL(rm.url, "")
+		result, err := fetchFromURL(context.Background(), rm.url, "")
 		if err != nil {
 			// Try loading from local cache
 			if rules := rm.loadCache(); rules != nil {
@@ -219,7 +229,7 @@ func (rm *RuleManager) refreshURL(ctx context.Context) {
 			currentEtag := rm.etag
 			rm.mu.RUnlock()
 
-			result, err := fetchFromURL(rm.url, currentEtag)
+			result, err := fetchFromURL(ctx, rm.url, currentEtag)
 			if err != nil {
 				rm.logger.Warn("remote rule refresh failed",
 					zap.String("url", rm.url), zap.Error(err))
