@@ -28,11 +28,11 @@ xcaddy build --with github.com/ysicing/caddy2-ipban
 
 example.com {
     ipban {
-        # 规则来源（都不配置则使用内置默认规则）
-        rule_file /etc/caddy/rules.json
-        rule_url  https://example.com/rules.json
+        # 规则来源（不配置则使用内置默认规则）
+        # 本地文件：rule_source /etc/caddy/rules.json
+        # 远程 URL：rule_source https://example.com/rules.json
+        rule_source /etc/caddy/rules.json
         refresh_interval 1h
-        cache_dir /var/lib/caddy/ipban
 
         # 白名单（私有/回环 IP 自动跳过）
         allow 198.51.100.0/24 203.0.113.50
@@ -44,11 +44,8 @@ example.com {
         # 封禁时长（0 = 永久）
         ban_duration 24h
 
-        # 返回给被封禁请求的随机状态码
-        status_codes 400 403 404 429
-
-        # 持久化封禁记录（重启后恢复）
-        persist_file /var/lib/caddy/ipban_bans.json
+        # 返回给被封禁请求的状态码（默认: 451，可自定义多个随机返回）
+        # status_codes 400 403 404 429
 
         # Linux ipset 内核级封锁
         # ipset_name blacklist
@@ -56,7 +53,7 @@ example.com {
 }
 ```
 
-所有配置项均可选，零配置即可使用内置默认规则。
+所有配置项均可选，零配置即可使用内置默认规则。封禁记录和远程规则缓存自动存储到 Caddy 数据目录。
 
 ## 规则格式
 

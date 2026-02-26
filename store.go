@@ -3,7 +3,6 @@ package ipban
 import (
 	"context"
 	"encoding/json"
-	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -14,10 +13,11 @@ import (
 
 // BanRecord represents a single banned IP entry.
 type BanRecord struct {
-	IP        string    `json:"ip"`
-	Reason    string    `json:"reason"`
-	BannedAt  time.Time `json:"banned_at"`
-	ExpiresAt time.Time `json:"expires_at,omitempty"`
+	IP        string     `json:"ip"`
+	Reason    string     `json:"reason"`
+	Host      string     `json:"host,omitempty"`
+	BannedAt  time.Time  `json:"banned_at"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
 // hitRecord tracks malicious request counts for threshold-based banning.
@@ -32,6 +32,7 @@ type hitRecord struct {
 const maxHitEntries = 100000
 
 // Store manages banned IPs with optional file persistence.
+// Shared across sites via UsagePool — a malicious IP banned on one site is banned everywhere.
 type Store struct {
 	mu        sync.RWMutex
 	records   map[string]*BanRecord
@@ -39,6 +40,7 @@ type Store struct {
 	filePath  string
 	saveTimer *time.Timer
 	logger    *zap.Logger
+	cancel    context.CancelFunc
 }
 
 // NewStore creates a store, loading persisted data if filePath is set.
@@ -66,12 +68,12 @@ func (s *Store) IsBanned(ip string) bool {
 		s.mu.RUnlock()
 		return false
 	}
-	expired := !r.ExpiresAt.IsZero() && time.Now().After(r.ExpiresAt)
+	expired := r.ExpiresAt != nil && time.Now().After(*r.ExpiresAt)
 	s.mu.RUnlock()
 
 	if expired {
 		s.mu.Lock()
-		if r, ok := s.records[ip]; ok && !r.ExpiresAt.IsZero() && time.Now().After(r.ExpiresAt) {
+		if r, ok := s.records[ip]; ok && r.ExpiresAt != nil && time.Now().After(*r.ExpiresAt) {
 			delete(s.records, ip)
 		}
 		s.mu.Unlock()
@@ -81,12 +83,13 @@ func (s *Store) IsBanned(ip string) bool {
 }
 
 // Ban adds an IP to the blacklist.
-func (s *Store) Ban(ip, reason string, duration time.Duration) {
+func (s *Store) Ban(ip, reason, host string, duration time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	r := &BanRecord{IP: ip, Reason: reason, BannedAt: time.Now()}
+	r := &BanRecord{IP: ip, Reason: reason, Host: host, BannedAt: time.Now()}
 	if duration > 0 {
-		r.ExpiresAt = time.Now().Add(duration)
+		exp := time.Now().Add(duration)
+		r.ExpiresAt = &exp
 	}
 	s.records[ip] = r
 	s.debounceSave()
@@ -117,8 +120,9 @@ func (s *Store) RecordHit(ip string, window time.Duration) int {
 	h, ok := s.hits[ip]
 	if !ok || now.Sub(h.firstHit) > h.window {
 		// Prevent unbounded growth from distributed scanning attacks.
+		// When full, silently drop new entries to avoid false-positive bans.
 		if !ok && len(s.hits) >= maxHitEntries {
-			return math.MaxInt
+			return 0
 		}
 		s.hits[ip] = &hitRecord{count: 1, firstHit: now, window: window}
 		return 1
@@ -142,7 +146,7 @@ func (s *Store) Cleanup() {
 	}
 	now := time.Now()
 	for ip, r := range s.records {
-		if !r.ExpiresAt.IsZero() && now.After(r.ExpiresAt) {
+		if r.ExpiresAt != nil && now.After(*r.ExpiresAt) {
 			delete(s.records, ip)
 		}
 	}
@@ -161,8 +165,14 @@ func (s *Store) Cleanup() {
 }
 
 // StartCleanup begins a background goroutine that periodically removes expired entries.
-// The goroutine exits when ctx is cancelled (standard Caddy lifecycle pattern).
-func (s *Store) StartCleanup(ctx context.Context, interval time.Duration) {
+// Uses its own context because Store is shared via UsagePool — its lifecycle is
+// managed by reference counting, not by any single module's context.
+func (s *Store) StartCleanup(interval time.Duration) {
+	if s.cancel != nil {
+		return // already started
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -177,6 +187,20 @@ func (s *Store) StartCleanup(ctx context.Context, interval time.Duration) {
 	}()
 }
 
+// Stop terminates the cleanup goroutine.
+func (s *Store) Stop() {
+	if s.cancel != nil {
+		s.cancel()
+	}
+}
+
+// Destruct implements caddy.Destructor for UsagePool ref-counting.
+func (s *Store) Destruct() error {
+	s.Stop()
+	s.Cleanup()
+	return nil
+}
+
 func (s *Store) load() error {
 	data, err := os.ReadFile(s.filePath)
 	if err != nil {
@@ -188,7 +212,7 @@ func (s *Store) load() error {
 	}
 	now := time.Now()
 	for _, r := range records {
-		if !r.ExpiresAt.IsZero() && now.After(r.ExpiresAt) {
+		if r.ExpiresAt != nil && now.After(*r.ExpiresAt) {
 			continue
 		}
 		s.records[r.IP] = r
@@ -201,7 +225,7 @@ func (s *Store) save() error {
 	records := make([]*BanRecord, 0, len(s.records))
 	now := time.Now()
 	for _, r := range s.records {
-		if !r.ExpiresAt.IsZero() && now.After(r.ExpiresAt) {
+		if r.ExpiresAt != nil && now.After(*r.ExpiresAt) {
 			continue
 		}
 		records = append(records, r)

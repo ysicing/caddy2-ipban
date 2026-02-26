@@ -1,0 +1,12 @@
+{
+	order ipban first
+	servers {
+		trusted_proxies static 127.0.0.0/8 ::1
+	}
+}
+
+:8080 {
+	ipban
+
+	respond "Hello, World!" 200
+}

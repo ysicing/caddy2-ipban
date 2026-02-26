@@ -47,3 +47,9 @@ tasks:
     cmds:
       - rm -f caddy
       - go clean -cache -testcache
+
+  test:e2e:
+    desc: Build and run E2E test against local caddy
+    deps: [build]
+    cmds:
+      - ./testdata/test.sh

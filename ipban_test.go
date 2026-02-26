@@ -230,7 +230,7 @@ func TestStore(t *testing.T) {
 		if s.IsBanned("1.2.3.4") {
 			t.Error("should not be banned initially")
 		}
-		s.Ban("1.2.3.4", "test", 0)
+		s.Ban("1.2.3.4", "test", "", 0)
 		if !s.IsBanned("1.2.3.4") {
 			t.Error("should be banned after Ban()")
 		}
@@ -238,7 +238,7 @@ func TestStore(t *testing.T) {
 
 	t.Run("ban with expiry", func(t *testing.T) {
 		s, _ := NewStore("", nil)
-		s.Ban("1.2.3.4", "test", 1*time.Millisecond)
+		s.Ban("1.2.3.4", "test", "", 1*time.Millisecond)
 		time.Sleep(5 * time.Millisecond)
 		if s.IsBanned("1.2.3.4") {
 			t.Error("should have expired")
@@ -249,7 +249,7 @@ func TestStore(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "bans.json")
 		s1, _ := NewStore(path, nil)
-		s1.Ban("10.0.0.1", "test", 0)
+		s1.Ban("10.0.0.1", "test", "", 0)
 		// Wait for debounced save to complete
 		time.Sleep(2 * time.Second)
 
@@ -304,7 +304,7 @@ func TestIsPublicIP(t *testing.T) {
 		{"127.0.0.1", false},
 		{"::1", false},
 		{"fe80::1", false},
-		{"2001:db8::1", true}, // documentation range, not flagged by IsPrivate
+		{"2001:db8::1", false}, // RFC 3849 documentation range
 		{"2400:cb00::1", true},
 		{"0.0.0.0", false},
 		{"invalid", false},
@@ -427,6 +427,7 @@ func newTestIPBan(t *testing.T) *IPBan {
 	store, _ := NewStore("", nil)
 	return &IPBan{
 		StatusCodes: []int{403},
+		Threshold:   1,
 		ruleMgr:     rm,
 		store:       store,
 		ipset:       NewIPSet(""),
@@ -466,7 +467,7 @@ func TestServeHTTP_AllowsNormalRequest(t *testing.T) {
 
 func TestServeHTTP_BlocksBannedIP(t *testing.T) {
 	m := newTestIPBan(t)
-	m.store.Ban("1.2.3.4", "test", 0)
+	m.store.Ban("1.2.3.4", "test", "", 0)
 
 	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
 		w.WriteHeader(200)

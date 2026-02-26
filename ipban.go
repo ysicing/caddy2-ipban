@@ -2,9 +2,11 @@ package ipban
 
 import (
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -36,27 +38,24 @@ func init() {
 //	    ipban { ... }
 //	}
 type IPBan struct {
-	// RuleFile is a local JSON rule file path. Auto-reloaded on change.
-	RuleFile string `json:"rule_file,omitempty"`
-	// RuleURL is a remote JSON rule URL. Periodically refreshed.
-	RuleURL string `json:"rule_url,omitempty"`
-	// RefreshInterval for remote rule refresh. Default: 1h.
+	// RuleSource is a local file path or remote URL for rules.
+	// Starts with http:// or https:// → remote URL (ETag + periodic refresh).
+	// Otherwise → local file (fsnotify hot-reload).
+	// Empty → built-in default rules.
+	RuleSource string `json:"rule_source,omitempty"`
+	// RefreshInterval for remote rule refresh. Default: 8h.
 	RefreshInterval caddy.Duration `json:"refresh_interval,omitempty"`
-	// CacheDir for caching remote rules locally. Default: Caddy data dir.
-	CacheDir string `json:"cache_dir,omitempty"`
 	// IPSetName enables ipset-based kernel blocking. Empty = disabled.
 	IPSetName string `json:"ipset_name,omitempty"`
-	// PersistFile enables file-based ban persistence. Empty = disabled.
-	PersistFile string `json:"persist_file,omitempty"`
-	// StatusCodes to randomly return. Default: [400,403,404,429].
+	// StatusCodes to randomly return. Default: [451].
 	StatusCodes []int `json:"status_codes,omitempty"`
 	// BanDuration is how long an IP stays banned. 0 = permanent.
 	BanDuration caddy.Duration `json:"ban_duration,omitempty"`
 	// Allowlist is a list of IPs or CIDRs that are never banned.
 	Allowlist []string `json:"allowlist,omitempty"`
-	// Threshold is the number of malicious hits before banning. Default: 1.
+	// Threshold is the number of malicious hits before banning. Default: 3.
 	Threshold int `json:"threshold,omitempty"`
-	// ThresholdWindow is the time window for counting hits. Default: 1h.
+	// ThresholdWindow is the time window for counting hits. Default: 24h.
 	ThresholdWindow caddy.Duration `json:"threshold_window,omitempty"`
 
 	ruleMgr   *RuleManager
@@ -71,6 +70,10 @@ type IPBan struct {
 // a single RuleManager (one set of goroutines, one fsnotify watcher).
 var rulePool = caddy.NewUsagePool()
 
+// storePool allows all sites to share a single ban Store.
+// A malicious IP banned on one site is banned everywhere.
+var storePool = caddy.NewUsagePool()
+
 // CaddyModule returns the Caddy module information.
 func (IPBan) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
@@ -84,13 +87,13 @@ func (m *IPBan) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger()
 
 	if len(m.StatusCodes) == 0 {
-		m.StatusCodes = []int{400, 403, 404, 429}
+		m.StatusCodes = []int{451}
 	}
 	if m.Threshold <= 0 {
-		m.Threshold = 1
+		m.Threshold = 3
 	}
 	if time.Duration(m.ThresholdWindow) == 0 {
-		m.ThresholdWindow = caddy.Duration(1 * time.Hour)
+		m.ThresholdWindow = caddy.Duration(24 * time.Hour)
 	}
 
 	for _, entry := range m.Allowlist {
@@ -111,18 +114,22 @@ func (m *IPBan) Provision(ctx caddy.Context) error {
 
 	interval := time.Duration(m.RefreshInterval)
 	if interval == 0 {
-		interval = 1 * time.Hour
+		interval = 8 * time.Hour
 	}
 
-	cacheDir := m.CacheDir
-	if cacheDir == "" && m.RuleURL != "" {
-		// Default: use Caddy's data directory
+	cacheDir := ""
+	filePath := ""
+	urlStr := ""
+	if isRemoteSource(m.RuleSource) {
+		urlStr = m.RuleSource
 		cacheDir = caddy.AppDataDir()
+	} else if m.RuleSource != "" {
+		filePath = m.RuleSource
 	}
 
-	m.ruleKey = fmt.Sprintf("rules:%s:%s:%s:%d", m.RuleFile, m.RuleURL, cacheDir, interval)
+	m.ruleKey = fmt.Sprintf("rules:%s:%d", m.RuleSource, interval)
 	val, _, err := rulePool.LoadOrNew(m.ruleKey, func() (caddy.Destructor, error) {
-		rm, err := NewRuleManager(m.RuleFile, m.RuleURL, cacheDir, interval, m.logger)
+		rm, err := NewRuleManager(filePath, urlStr, cacheDir, interval, m.logger)
 		if err != nil {
 			return nil, err
 		}
@@ -134,11 +141,21 @@ func (m *IPBan) Provision(ctx caddy.Context) error {
 	}
 	m.ruleMgr = val.(*RuleManager)
 
-	m.store, err = NewStore(m.PersistFile, m.logger)
+	// Store is shared across all sites via storePool — malicious IPs are banned globally.
+	// Persists to <caddy_data_dir>/ipban_bans.json.
+	persistPath := filepath.Join(caddy.AppDataDir(), "ipban_bans.json")
+	storeVal, _, err := storePool.LoadOrNew("store", func() (caddy.Destructor, error) {
+		s, err := NewStore(persistPath, m.logger)
+		if err != nil {
+			return nil, err
+		}
+		s.StartCleanup(5 * time.Minute)
+		return s, nil
+	})
 	if err != nil {
 		return fmt.Errorf("ipban: init store: %w", err)
 	}
-	m.store.StartCleanup(ctx, 5*time.Minute)
+	m.store = storeVal.(*Store)
 
 	m.ipset = NewIPSet(m.IPSetName)
 	if m.IPSetName != "" && !m.ipset.Available() {
@@ -147,16 +164,13 @@ func (m *IPBan) Provision(ctx caddy.Context) error {
 	}
 
 	src := "defaults"
-	if m.RuleFile != "" {
-		src = m.RuleFile
-	}
-	if m.RuleURL != "" {
-		src += " + " + m.RuleURL
+	if m.RuleSource != "" {
+		src = m.RuleSource
 	}
 	m.logger.Info("ipban ready",
 		zap.String("rules", src),
 		zap.Bool("ipset", m.ipset.Available()),
-		zap.Bool("persist", m.PersistFile != ""))
+		zap.Bool("persist", m.store.filePath != ""))
 	return nil
 }
 
@@ -185,16 +199,12 @@ func (m *IPBan) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp
 
 	if m.ruleMgr.Match(r.URL.Path, r.UserAgent()) {
 		reason := truncatedReason(r.URL.Path, r.UserAgent())
-		if m.Threshold <= 1 {
-			m.ban(ip, reason)
-			return m.block(w)
-		}
+		host := r.Host
 		window := time.Duration(m.ThresholdWindow)
 		count := m.store.RecordHit(ip, window)
 		if count >= m.Threshold {
-			m.ban(ip, reason)
+			m.ban(ip, reason, host)
 			m.store.ClearHits(ip)
-			return m.block(w)
 		}
 		return m.block(w)
 	}
@@ -207,15 +217,13 @@ func (m *IPBan) Cleanup() error {
 	if m.ruleKey != "" {
 		_, _ = rulePool.Delete(m.ruleKey)
 	}
-	if m.store != nil {
-		m.store.Cleanup()
-	}
+	_, _ = storePool.Delete("store")
 	return nil
 }
 
-func (m *IPBan) ban(ip, reason string) {
+func (m *IPBan) ban(ip, reason, host string) {
 	dur := time.Duration(m.BanDuration)
-	m.store.Ban(ip, reason, dur)
+	m.store.Ban(ip, reason, host, dur)
 	if m.ipset.Available() {
 		go func(ipStr string) {
 			if err := m.ipset.Add(ipStr); err != nil {
@@ -227,7 +235,7 @@ func (m *IPBan) ban(ip, reason string) {
 }
 
 func (m *IPBan) block(w http.ResponseWriter) error {
-	code := m.StatusCodes[rand.Intn(len(m.StatusCodes))]
+	code := m.StatusCodes[rand.IntN(len(m.StatusCodes))]
 	w.WriteHeader(code)
 	_, _ = w.Write([]byte(http.StatusText(code)))
 	return nil
@@ -242,10 +250,16 @@ func isPublicIP(ipStr string) bool {
 	return isPublicIPParsed(ip)
 }
 
+// docPrefix is RFC 3849 documentation-only IPv6 range, not covered by net.IP.IsPrivate().
+var docPrefix = net.IPNet{
+	IP:   net.ParseIP("2001:db8::"),
+	Mask: net.CIDRMask(32, 128),
+}
+
 // isPublicIPParsed checks a pre-parsed IP to avoid redundant parsing on the hot path.
 func isPublicIPParsed(ip net.IP) bool {
 	return !ip.IsLoopback() && !ip.IsPrivate() && !ip.IsLinkLocalUnicast() &&
-		!ip.IsLinkLocalMulticast() && !ip.IsUnspecified()
+		!ip.IsLinkLocalMulticast() && !ip.IsUnspecified() && !docPrefix.Contains(ip)
 }
 
 // isAllowed checks if the IP matches any allowlist entry.
@@ -295,4 +309,9 @@ func clientIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// isRemoteSource returns true if the source string looks like a URL.
+func isRemoteSource(s string) bool {
+	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
 }

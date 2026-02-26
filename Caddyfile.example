@@ -1,33 +1,44 @@
+# ipban Caddyfile 配置示例
+#
+# 全局声明处理顺序（必须）
 {
 	order ipban first
 }
 
+# ============================================================
+# 用法一：零配置（推荐）
+# 使用内置默认规则，所有参数取默认值
+# ============================================================
 example.com {
-	ipban {
-		# Rule sources (omit both to use built-in defaults)
-		rule_file /etc/caddy/rules.json
-		rule_url  https://example.com/rules.json
-		refresh_interval 1h
-		cache_dir /var/lib/caddy/ipban
+	ipban
+}
 
-		# Allowlist: public IPs/CIDRs that should never be banned
-		# (private/loopback IPs are always skipped automatically)
+# ============================================================
+# 用法二：自定义配置
+# ============================================================
+example.org {
+	ipban {
+		# 规则来源（不配置则使用内置默认规则）
+		# 本地文件（fsnotify 热重载）：
+		rule_source /etc/caddy/rules.json
+		# 或远程 URL（ETag + 定时刷新）：
+		# rule_source https://example.com/rules.json
+		refresh_interval 1h
+
+		# 白名单（私有/回环 IP 自动跳过）
 		allow 198.51.100.0/24 203.0.113.50
 
-		# Threshold: require 3 malicious hits within 1h before banning
+		# 阈值：窗口内达到 N 次恶意请求后封禁
 		threshold 3
 		threshold_window 1h
 
-		# Ban duration (0 = permanent)
+		# 封禁时长（0 = 永久）
 		ban_duration 24h
 
-		# Random status codes returned to blocked requests
-		status_codes 400 403 404 429
+		# 返回给被封禁请求的状态码（默认: 451，可自定义多个随机返回）
+		# status_codes 400 403 404 429
 
-		# Optional: persist bans to disk (survive restarts)
-		persist_file /var/lib/caddy/ipban_bans.json
-
-		# Optional: Linux ipset kernel-level blocking
+		# Linux ipset 内核级封锁
 		# ipset_name blacklist
 	}
 }

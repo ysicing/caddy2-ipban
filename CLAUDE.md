@@ -37,12 +37,12 @@ Private/loopback IPs and allowlisted IPs are skipped. Blocked requests get a ran
 - **Rules** (`rules.go`) — Rule JSON format definition (sing-box inspired), compiled rule matching, and HTTP fetch logic. Rules support: `path`, `path_prefix`, `path_keyword`, `path_regex`, `user_agent_keyword`, `user_agent_regex`, `invert`.
 - **Store** (`store.go`) — In-memory banned IP map with `sync.RWMutex`. Supports TTL-based expiry, periodic cleanup, JSON file persistence, and hit counting for threshold-based banning.
 - **IPSet** (`ipset.go`) — Wraps Linux `ipset` CLI. Gracefully degrades when unavailable (macOS, no permissions).
-- **Defaults** (`defaults.go`) — Built-in `RuleFile` used when no rule_file/rule_url is configured.
+- **Defaults** (`defaults.go`) — Built-in `RuleFile` used when no rule_source is configured.
 - **Caddyfile** (`caddyfile.go`) — Caddyfile unmarshaling and interface guards.
 
 ### Rule Sources (priority)
 
-`fileRules` and `urlRules` are stored separately and both checked on every request. If neither `rule_file` nor `rule_url` is configured, built-in defaults from `defaults.go` are loaded into `fileRules`.
+`fileRules` and `urlRules` are stored separately and both checked on every request. If `rule_source` is not configured, built-in defaults from `defaults.go` are loaded into `fileRules`.
 
 ### Concurrency Model
 
@@ -63,7 +63,7 @@ This project follows Caddy module development conventions:
 ## Caddyfile Options
 
 ```
-rule_file, rule_url, refresh_interval, cache_dir,
+rule_source, refresh_interval,
 ipset_name, persist_file, status_codes, ban_duration,
 allow, threshold, threshold_window
 ```
