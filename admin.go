@@ -109,9 +109,6 @@ func getIPSet() *IPSet {
 func setActiveStore(s *Store) {
 	activeGlobalMu.Lock()
 	activeStore = s
-	if s == nil {
-		activeIPSet = nil
-	}
 	activeGlobalMu.Unlock()
 }
 

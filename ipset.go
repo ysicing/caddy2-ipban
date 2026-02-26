@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -29,6 +30,7 @@ type IPSet struct {
 
 	// Batching: QueueAdd sends IPs here; the worker flushes via AddBatch.
 	banCh    chan string
+	stopped  atomic.Bool // set by Stop() before closing banCh
 	stopOnce sync.Once
 	done     chan struct{}
 }
@@ -63,6 +65,7 @@ func (s *IPSet) Start() {
 func (s *IPSet) Stop() {
 	s.stopOnce.Do(func() {
 		if s.banCh != nil {
+			s.stopped.Store(true)
 			close(s.banCh)
 			<-s.done // wait for worker to drain and exit
 		}
@@ -78,7 +81,7 @@ func (s *IPSet) Destruct() error {
 // QueueAdd enqueues an IP for batched addition to the kernel set.
 // Non-blocking: if the channel is full, the IP is dropped (still banned in-memory).
 func (s *IPSet) QueueAdd(ip string) {
-	if !s.available || s.banCh == nil {
+	if !s.available || s.banCh == nil || s.stopped.Load() {
 		return
 	}
 	if net.ParseIP(ip) == nil {

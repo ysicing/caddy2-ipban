@@ -316,19 +316,11 @@ func TestIsPublicIP(t *testing.T) {
 func TestAllowlist(t *testing.T) {
 	m := newTestIPBan(t)
 	m.Allowlist = []string{"8.8.8.0/24", "1.2.3.4"}
-	// Parse allowlist like Provision does
-	for _, entry := range m.Allowlist {
-		_, n, err := net.ParseCIDR(entry)
-		if err != nil {
-			ip := net.ParseIP(entry)
-			bits := 32
-			if ip.To4() == nil {
-				bits = 128
-			}
-			n = &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}
-		}
-		m.allowNets = append(m.allowNets, n)
+	nets, err := parseAllowlist(m.Allowlist)
+	if err != nil {
+		t.Fatal(err)
 	}
+	m.allowNets = nets
 
 	if !m.isAllowedParsed(net.ParseIP("8.8.8.1")) {
 		t.Error("8.8.8.1 should be allowed (in 8.8.8.0/24)")
@@ -423,13 +415,14 @@ func newTestIPBan(t *testing.T) *IPBan {
 	}
 	store, _ := NewStore("", nil)
 	return &IPBan{
-		StatusCodes:  []int{403},
-		statusBodies: [][]byte{[]byte(http.StatusText(403))},
-		Threshold:    1,
-		ruleMgr:      rm,
-		store:        store,
-		ipset:        NewIPSet("", nil),
-		logger:       zap.NewNop(),
+		StatusCodes:     []int{403},
+		statusBodies:    [][]byte{[]byte(http.StatusText(403))},
+		Threshold:       1,
+		ThresholdWindow: caddy.Duration(24 * time.Hour),
+		ruleMgr:         rm,
+		store:           store,
+		ipset:           NewIPSet("", nil),
+		logger:          zap.NewNop(),
 	}
 }
 
@@ -507,7 +500,7 @@ func TestValidate(t *testing.T) {
 		wantErr bool
 	}{
 		{"valid", IPBan{StatusCodes: []int{403}}, false},
-		{"empty status codes", IPBan{}, true},
+		{"empty status codes ok after provision", IPBan{}, false},
 		{"non-4xx code", IPBan{StatusCodes: []int{500}}, true},
 		{"negative ban_duration", IPBan{StatusCodes: []int{403}, BanDuration: caddy.Duration(-time.Hour)}, true},
 		{"negative threshold_window", IPBan{StatusCodes: []int{403}, ThresholdWindow: caddy.Duration(-time.Hour)}, true},

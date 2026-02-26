@@ -54,6 +54,9 @@ type Store struct {
 
 // NewStore creates a store, loading persisted data if filePath is set.
 func NewStore(filePath string, logger *zap.Logger) (*Store, error) {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	s := &Store{
 		records:  make(map[string]*BanRecord),
 		hits:     make(map[string]*hitRecord),
@@ -89,10 +92,8 @@ func (s *Store) Ban(ip, reason, host string, duration time.Duration) bool {
 	defer s.mu.Unlock()
 	// Prevent unbounded growth — skip if at capacity and IP is not already banned.
 	if _, exists := s.records[ip]; !exists && len(s.records) >= maxBanEntries {
-		if s.logger != nil {
-			s.logger.Warn("ban table full, cannot ban new IP",
-				zap.String("ip", ip), zap.Int("limit", maxBanEntries))
-		}
+		s.logger.Warn("ban table full, cannot ban new IP",
+			zap.String("ip", ip), zap.Int("limit", maxBanEntries))
 		return false
 	}
 	now := time.Now()
@@ -159,7 +160,7 @@ func (s *Store) debounceSave() {
 		}
 		s.saveTimer = nil
 		s.mu.Unlock()
-		if err := s.save(); err != nil && s.logger != nil {
+		if err := s.save(); err != nil {
 			s.logger.Warn("persist save failed", zap.Error(err))
 		}
 	})
@@ -178,7 +179,7 @@ func (s *Store) RecordHit(ip string, window time.Duration) int {
 		// Don't purge inline — that's O(N) under lock on the hot path.
 		// The background Cleanup() goroutine handles expired entry removal.
 		if !ok && len(s.hits) >= maxHitEntries {
-			if !s.hitsFullLogged && s.logger != nil {
+			if !s.hitsFullLogged {
 				s.logger.Warn("hit tracking table full, new IPs will not be tracked",
 					zap.Int("limit", maxHitEntries))
 				s.hitsFullLogged = true
@@ -245,7 +246,7 @@ func (s *Store) Cleanup() {
 	}
 
 	if s.filePath != "" {
-		if err := s.save(); err != nil && s.logger != nil {
+		if err := s.save(); err != nil {
 			s.logger.Warn("cleanup persist save failed", zap.Error(err))
 		}
 	}

@@ -107,21 +107,11 @@ func (m *IPBan) Provision(ctx caddy.Context) error {
 		m.ThresholdWindow = caddy.Duration(24 * time.Hour)
 	}
 
-	for _, entry := range m.Allowlist {
-		_, n, err := net.ParseCIDR(entry)
-		if err != nil {
-			ip := net.ParseIP(entry)
-			if ip == nil {
-				return fmt.Errorf("ipban: invalid allowlist entry %q", entry)
-			}
-			bits := 32
-			if ip.To4() == nil {
-				bits = 128
-			}
-			n = &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}
-		}
-		m.allowNets = append(m.allowNets, n)
+	nets, err := parseAllowlist(m.Allowlist)
+	if err != nil {
+		return err
 	}
+	m.allowNets = nets
 
 	interval := time.Duration(m.RefreshInterval)
 	if interval == 0 {
@@ -223,9 +213,6 @@ func (m *IPBan) Provision(ctx caddy.Context) error {
 
 // Validate ensures the configuration is valid.
 func (m *IPBan) Validate() error {
-	if len(m.StatusCodes) == 0 {
-		return fmt.Errorf("ipban: status_codes must not be empty")
-	}
 	for _, code := range m.StatusCodes {
 		if code < 400 || code > 499 {
 			return fmt.Errorf("ipban: status code %d is not a 4xx code", code)
@@ -256,14 +243,16 @@ func (m *IPBan) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp
 		return m.block(w)
 	}
 
-	if m.ruleMgr.Match(r.URL.Path, r.UserAgent()) {
+	ua := r.UserAgent()
+	if m.ruleMgr.Match(r.URL.Path, ua) {
 		window := time.Duration(m.ThresholdWindow)
 		count := m.store.RecordHit(ip, window)
 		if count >= m.Threshold {
-			reason := truncatedReason(r.URL.Path, r.UserAgent())
+			reason := truncatedReason(r.URL.Path, ua)
 			host := sanitizeLogField(truncateField(r.Host, 256))
-			m.store.ClearHits(ip)
-			m.ban(ip, reason, host)
+			if m.ban(ip, reason, host) {
+				m.store.ClearHits(ip)
+			}
 		}
 		return m.block(w)
 	}
@@ -326,6 +315,30 @@ func (m *IPBan) isAllowedParsed(ip net.IP) bool {
 	return false
 }
 
+// parseAllowlist parses a list of IP/CIDR strings into []*net.IPNet.
+func parseAllowlist(entries []string) ([]*net.IPNet, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	nets := make([]*net.IPNet, 0, len(entries))
+	for _, entry := range entries {
+		_, n, err := net.ParseCIDR(entry)
+		if err != nil {
+			ip := net.ParseIP(entry)
+			if ip == nil {
+				return nil, fmt.Errorf("ipban: invalid allowlist entry %q", entry)
+			}
+			bits := 32
+			if ip.To4() == nil {
+				bits = 128
+			}
+			n = &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}
+		}
+		nets = append(nets, n)
+	}
+	return nets, nil
+}
+
 // truncatedReason builds a ban reason string, truncating path and UA to prevent
 // log injection and excessive log/persistence size.
 // Control characters are stripped to prevent log injection.
@@ -335,12 +348,16 @@ func truncatedReason(path, ua string) string {
 	return "path:" + path + " ua:" + ua
 }
 
-// truncateField truncates a string to maxLen, appending "..." if truncated.
+// truncateField truncates a string to maxLen bytes, respecting UTF-8 boundaries.
 func truncateField(s string, maxLen int) string {
-	if len(s) > maxLen {
-		return s[:maxLen] + "..."
+	if len(s) <= maxLen {
+		return s
 	}
-	return s
+	// Back up to the nearest valid UTF-8 start byte.
+	for maxLen > 0 && maxLen < len(s) && s[maxLen]>>6 == 0b10 {
+		maxLen--
+	}
+	return s[:maxLen] + "..."
 }
 
 // sanitizeLogField removes control characters (< 0x20) to prevent log injection.
