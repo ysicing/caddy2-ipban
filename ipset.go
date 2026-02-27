@@ -14,8 +14,11 @@ import (
 	"go.uber.org/zap"
 )
 
-// ipsetTimeout is the maximum time allowed for a single ipset command.
+// ipsetTimeout is the maximum time allowed for a single ipset/nft command.
 const ipsetTimeout = 10 * time.Second
+
+// nftTableName is the nftables table used for IP banning.
+const nftTableName = "ipban_caddy"
 
 // validIPSetName restricts ipset names to safe characters only.
 var validIPSetName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
@@ -28,9 +31,10 @@ type IPSet struct {
 	name      string
 	ipv6      bool // true for IPv6 (hash:ip family inet6 + ip6tables)
 	available bool
+	useNft    bool // true when using nftables backend
 	logger    *zap.Logger
 
-	// iptables rule management
+	// iptables rule management (ipset backend only)
 	iptablesManaged bool // true if we added the iptables rule
 
 	// Batching: QueueAdd sends IPs here; the worker flushes via AddBatch.
@@ -84,10 +88,14 @@ func (s *IPSet) Stop() {
 }
 
 // Destruct implements caddy.Destructor for UsagePool ref-counting.
-// Removes the iptables rule if we added it.
+// Removes the nftables table or iptables rule depending on backend.
 func (s *IPSet) Destruct() error {
 	s.Stop()
-	s.removeIptablesRule()
+	if s.useNft {
+		s.removeNftTable()
+	} else {
+		s.removeIptablesRule()
+	}
 	return nil
 }
 
@@ -149,8 +157,16 @@ func (s *IPSet) batchWorker() {
 	}
 }
 
-// Add inserts an IP into the set. No-op if ipset is unavailable.
-// The IP is validated before passing to the ipset command.
+// nftElementCmd executes an nft element operation (add/delete) via stdin.
+func (s *IPSet) nftElementCmd(ctx context.Context, action, ip string) error {
+	script := fmt.Sprintf("%s element %s %s %s { %s }\n", action, s.nftFamily(), nftTableName, s.name, ip)
+	cmd := exec.CommandContext(ctx, "nft", "-f", "-")
+	cmd.Stdin = strings.NewReader(script)
+	return cmd.Run()
+}
+
+// Add inserts an IP into the set. No-op if unavailable.
+// The IP is validated before passing to the command.
 func (s *IPSet) Add(ip string) error {
 	if !s.available {
 		return nil
@@ -160,10 +176,13 @@ func (s *IPSet) Add(ip string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), ipsetTimeout)
 	defer cancel()
+	if s.useNft {
+		return s.nftElementCmd(ctx, "add", ip)
+	}
 	return exec.CommandContext(ctx, "ipset", "add", s.name, ip, "-exist").Run()
 }
 
-// Del removes an IP from the set. No-op if ipset is unavailable.
+// Del removes an IP from the set. No-op if unavailable.
 func (s *IPSet) Del(ip string) error {
 	if !s.available {
 		return nil
@@ -173,15 +192,42 @@ func (s *IPSet) Del(ip string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), ipsetTimeout)
 	defer cancel()
+	if s.useNft {
+		return s.nftElementCmd(ctx, "delete", ip)
+	}
 	return exec.CommandContext(ctx, "ipset", "del", s.name, ip, "-exist").Run()
 }
 
-// AddBatch inserts multiple IPs via `ipset restore` in a single process.
-// No-op if ipset is unavailable or ips is empty.
+// AddBatch inserts multiple IPs in a single process.
+// No-op if unavailable or ips is empty.
 // All IPs are assumed pre-validated by callers (QueueAdd validates via net.ParseIP).
 func (s *IPSet) AddBatch(ips []string) error {
 	if !s.available || len(ips) == 0 {
 		return nil
+	}
+	if s.useNft {
+		family := s.nftFamily()
+		var buf strings.Builder
+		buf.Grow(60 + len(ips)*18)
+		buf.WriteString("add element ")
+		buf.WriteString(family)
+		buf.WriteByte(' ')
+		buf.WriteString(nftTableName)
+		buf.WriteByte(' ')
+		buf.WriteString(s.name)
+		buf.WriteString(" { ")
+		for i, ip := range ips {
+			if i > 0 {
+				buf.WriteString(", ")
+			}
+			buf.WriteString(ip)
+		}
+		buf.WriteString(" }\n")
+		ctx, cancel := context.WithTimeout(context.Background(), ipsetTimeout)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "nft", "-f", "-")
+		cmd.Stdin = strings.NewReader(buf.String())
+		return cmd.Run()
 	}
 	var buf strings.Builder
 	for _, ip := range ips {
@@ -191,9 +237,6 @@ func (s *IPSet) AddBatch(ips []string) error {
 		buf.WriteString(ip)
 		buf.WriteString(" -exist\n")
 	}
-	if buf.Len() == 0 {
-		return nil
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), ipsetTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "ipset", "restore")
@@ -202,6 +245,79 @@ func (s *IPSet) AddBatch(ips []string) error {
 }
 
 func (s *IPSet) init() bool {
+	if s.initNft() {
+		return true
+	}
+	return s.initIpset()
+}
+
+// nftFamily returns the nftables family string for this set.
+func (s *IPSet) nftFamily() string {
+	if s.ipv6 {
+		return "ip6"
+	}
+	return "ip"
+}
+
+// nftAddrType returns the nftables address type for this set.
+func (s *IPSet) nftAddrType() string {
+	if s.ipv6 {
+		return "ipv6_addr"
+	}
+	return "ipv4_addr"
+}
+
+// nftSaddr returns the nftables source address match expression.
+func (s *IPSet) nftSaddr() string {
+	if s.ipv6 {
+		return "ip6 saddr"
+	}
+	return "ip saddr"
+}
+
+// initNft tries to set up nftables-based blocking. Returns true on success.
+func (s *IPSet) initNft() bool {
+	if _, err := exec.LookPath("nft"); err != nil {
+		return false
+	}
+	family := s.nftFamily()
+	// Check if our set already exists
+	ctx, cancel := context.WithTimeout(context.Background(), ipsetTimeout)
+	defer cancel()
+	if exec.CommandContext(ctx, "nft", "list", "set", family, nftTableName, s.name).Run() == nil {
+		s.useNft = true
+		return true
+	}
+	// Create table, set, chain, and rule via stdin.
+	// flush chain ensures no duplicate drop rules from prior unclean shutdown.
+	script := fmt.Sprintf(
+		"add table %s %s\nadd set %s %s %s { type %s; }\nadd chain %s %s input { type filter hook input priority -1; policy accept; }\nflush chain %s %s input\nadd rule %s %s input %s @%s drop\n",
+		family, nftTableName,
+		family, nftTableName, s.name, s.nftAddrType(),
+		family, nftTableName,
+		family, nftTableName,
+		family, nftTableName, s.nftSaddr(), s.name,
+	)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), ipsetTimeout)
+	defer cancel2()
+	cmd := exec.CommandContext(ctx2, "nft", "-f", "-")
+	cmd.Stdin = strings.NewReader(script)
+	if err := cmd.Run(); err != nil {
+		if s.logger != nil {
+			s.logger.Debug("nftables init failed, falling back to ipset",
+				zap.String("family", family), zap.Error(err))
+		}
+		return false
+	}
+	s.useNft = true
+	if s.logger != nil {
+		s.logger.Info("nftables set and rule created", zap.String("family", family), zap.String("set", s.name))
+	}
+	return true
+}
+
+// initIpset tries to set up ipset-based blocking. Returns true on success.
+func (s *IPSet) initIpset() bool {
 	if _, err := exec.LookPath("ipset"); err != nil {
 		return false
 	}
@@ -270,6 +386,22 @@ func (s *IPSet) ensureIptablesRule() {
 	s.iptablesManaged = true
 	if s.logger != nil {
 		s.logger.Info(fw+" DROP rule added", zap.String("set", s.name))
+	}
+}
+
+// removeNftTable deletes the nftables table (which removes all sets, chains, and rules within it).
+func (s *IPSet) removeNftTable() {
+	family := s.nftFamily()
+	ctx, cancel := context.WithTimeout(context.Background(), ipsetTimeout)
+	defer cancel()
+	if err := exec.CommandContext(ctx, "nft", "delete", "table", family, nftTableName).Run(); err != nil {
+		if s.logger != nil {
+			s.logger.Warn("failed to remove nftables table", zap.String("family", family), zap.Error(err))
+		}
+		return
+	}
+	if s.logger != nil {
+		s.logger.Info("nftables table removed", zap.String("family", family))
 	}
 }
 

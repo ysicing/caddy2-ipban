@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-02-27
+
+### Added
+- nftables (`nft`) native set backend as priority kernel-level IP blocking, with automatic fallback to ipset+iptables when nft is unavailable
+- `initNft()` creates nftables table/set/chain/rule via `nft -f -` stdin to avoid shell escaping issues
+- `removeNftTable()` for clean nftables teardown on module unload
+- `nftElementCmd()` shared helper for Add/Del nft element operations
+- nft branches in `Add()`, `Del()`, `AddBatch()` for nftables element management
+- `TestIPSetNftHelpers`, `TestIPSetInitFallback`, `TestIPSetDestructNftPath`, `TestIPSetDestructIpsetPath` tests
+
+### Changed
+- `init()` refactored into `initNft()` and `initIpset()`, trying nftables first then falling back to ipset
+- `Destruct()` selects cleanup path based on active backend (`removeNftTable` vs `removeIptablesRule`)
+- `IPSet` struct gains `useNft` field to track which backend is active
+- `initNft` script includes `flush chain` to prevent duplicate drop rules after unclean shutdown
+- `AddBatch` nft path uses `strings.Builder` with `Grow()` pre-allocation for reduced allocations
+
+### Fixed
+- `initNft` now logs Debug message on failure before falling back to ipset
+
+### Removed
+- Dead `buf.Len() == 0` check in `AddBatch` ipset path (unreachable after `len(ips) == 0` guard)
+
 ## [1.0.0] - 2026-02-26
 
 ### Added

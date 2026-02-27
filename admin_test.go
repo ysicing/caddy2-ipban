@@ -245,3 +245,55 @@ func TestIPSetManagerRouteV6(t *testing.T) {
 		t.Error("invalid IP should fallback to v4")
 	}
 }
+
+func TestIPSetNftHelpers(t *testing.T) {
+	tests := []struct {
+		ipv6     bool
+		family   string
+		addrType string
+		saddr    string
+	}{
+		{false, "ip", "ipv4_addr", "ip saddr"},
+		{true, "ip6", "ipv6_addr", "ip6 saddr"},
+	}
+	for _, tt := range tests {
+		s := &IPSet{ipv6: tt.ipv6}
+		if got := s.nftFamily(); got != tt.family {
+			t.Errorf("nftFamily(ipv6=%v): got %q, want %q", tt.ipv6, got, tt.family)
+		}
+		if got := s.nftAddrType(); got != tt.addrType {
+			t.Errorf("nftAddrType(ipv6=%v): got %q, want %q", tt.ipv6, got, tt.addrType)
+		}
+		if got := s.nftSaddr(); got != tt.saddr {
+			t.Errorf("nftSaddr(ipv6=%v): got %q, want %q", tt.ipv6, got, tt.saddr)
+		}
+	}
+}
+
+func TestIPSetInitFallback(t *testing.T) {
+	// On macOS/CI where neither nft nor ipset is available,
+	// init should return false and available should be false.
+	s := NewIPSet("test_fallback", nil)
+	if s.Available() {
+		t.Skip("nft or ipset is available on this system, skipping fallback test")
+	}
+	if s.useNft {
+		t.Error("useNft should be false when nft is unavailable")
+	}
+}
+
+func TestIPSetDestructNftPath(t *testing.T) {
+	// Destruct with useNft=true but available=false should not panic.
+	s := &IPSet{name: "test", useNft: true, available: false}
+	if err := s.Destruct(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIPSetDestructIpsetPath(t *testing.T) {
+	// Destruct with useNft=false and available=false should not panic.
+	s := &IPSet{name: "test", useNft: false, available: false}
+	if err := s.Destruct(); err != nil {
+		t.Fatal(err)
+	}
+}
