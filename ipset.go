@@ -23,10 +23,15 @@ var validIPSetName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 // IPSet wraps the Linux ipset command for kernel-level IP blocking.
 // Supports batched async adds via a background worker to avoid
 // forking thousands of processes under burst traffic.
+// Automatically manages iptables/ip6tables rules to DROP traffic from banned IPs.
 type IPSet struct {
 	name      string
+	ipv6      bool // true for IPv6 (hash:ip family inet6 + ip6tables)
 	available bool
 	logger    *zap.Logger
+
+	// iptables rule management
+	iptablesManaged bool // true if we added the iptables rule
 
 	// Batching: QueueAdd sends IPs here; the worker flushes via AddBatch.
 	banCh    chan string
@@ -35,10 +40,10 @@ type IPSet struct {
 	done     chan struct{}
 }
 
-// NewIPSet creates an IPSet handle. If the set doesn't exist it tries to create one.
-// Names containing invalid characters are rejected (available=false).
-func NewIPSet(name string, logger *zap.Logger) *IPSet {
-	s := &IPSet{name: name, logger: logger}
+// newIPSet creates an IPSet handle for a specific address family.
+// If the set doesn't exist it tries to create one.
+func newIPSet(name string, ipv6 bool, logger *zap.Logger) *IPSet {
+	s := &IPSet{name: name, ipv6: ipv6, logger: logger}
 	if name != "" {
 		if !validIPSetName.MatchString(name) {
 			return s // available remains false
@@ -46,6 +51,12 @@ func NewIPSet(name string, logger *zap.Logger) *IPSet {
 		s.available = s.init()
 	}
 	return s
+}
+
+// NewIPSet creates an IPv4 IPSet handle. If the set doesn't exist it tries to create one.
+// Names containing invalid characters are rejected (available=false).
+func NewIPSet(name string, logger *zap.Logger) *IPSet {
+	return newIPSet(name, false, logger)
 }
 
 // Available reports whether ipset can be used.
@@ -73,13 +84,16 @@ func (s *IPSet) Stop() {
 }
 
 // Destruct implements caddy.Destructor for UsagePool ref-counting.
+// Removes the iptables rule if we added it.
 func (s *IPSet) Destruct() error {
 	s.Stop()
+	s.removeIptablesRule()
 	return nil
 }
 
 // QueueAdd enqueues an IP for batched addition to the kernel set.
 // Non-blocking: if the channel is full, the IP is dropped (still banned in-memory).
+// The IP must already be validated by the caller (ServeHTTP path validates via net.ParseIP).
 func (s *IPSet) QueueAdd(ip string) {
 	if !s.available || s.banCh == nil || s.stopped.Load() {
 		return
@@ -87,6 +101,9 @@ func (s *IPSet) QueueAdd(ip string) {
 	if net.ParseIP(ip) == nil {
 		return
 	}
+	// Recover from send-on-closed-channel during the tiny window between
+	// stopped.Load() and close(banCh) in Stop().
+	defer func() { recover() }()
 	select {
 	case s.banCh <- ip:
 	default:
@@ -161,15 +178,18 @@ func (s *IPSet) Del(ip string) error {
 
 // AddBatch inserts multiple IPs via `ipset restore` in a single process.
 // No-op if ipset is unavailable or ips is empty.
+// All IPs are assumed pre-validated by callers (QueueAdd validates via net.ParseIP).
 func (s *IPSet) AddBatch(ips []string) error {
 	if !s.available || len(ips) == 0 {
 		return nil
 	}
 	var buf strings.Builder
 	for _, ip := range ips {
-		if net.ParseIP(ip) != nil {
-			fmt.Fprintf(&buf, "add %s %s -exist\n", s.name, ip)
-		}
+		buf.WriteString("add ")
+		buf.WriteString(s.name)
+		buf.WriteByte(' ')
+		buf.WriteString(ip)
+		buf.WriteString(" -exist\n")
 	}
 	if buf.Len() == 0 {
 		return nil
@@ -189,10 +209,176 @@ func (s *IPSet) init() bool {
 	defer cancel()
 	// Check if set exists (-t = headers only, avoids dumping all entries)
 	if err := exec.CommandContext(ctx, "ipset", "list", s.name, "-t").Run(); err == nil {
+		s.ensureIptablesRule()
 		return true
 	}
-	// Try to create it
+	// Try to create it with maxelem matching maxBanEntries to avoid silent failures.
 	ctx2, cancel2 := context.WithTimeout(context.Background(), ipsetTimeout)
 	defer cancel2()
-	return exec.CommandContext(ctx2, "ipset", "create", s.name, "hash:ip").Run() == nil
+	args := []string{"create", s.name, "hash:ip", "maxelem", "131072"}
+	if s.ipv6 {
+		args = append(args, "family", "inet6")
+	}
+	if exec.CommandContext(ctx2, "ipset", args...).Run() != nil {
+		return false
+	}
+	s.ensureIptablesRule()
+	return true
+}
+
+// iptablesRuleArgs returns the iptables arguments for the DROP rule referencing this ipset.
+// The action parameter should be "-C" (check), "-I" (insert), or "-D" (delete).
+func (s *IPSet) iptablesRuleArgs(action string) []string {
+	return []string{action, "INPUT", "-m", "set", "--match-set", s.name, "src", "-j", "DROP"}
+}
+
+// fwCmd returns the firewall command for this set's address family.
+func (s *IPSet) fwCmd() string {
+	if s.ipv6 {
+		return "ip6tables"
+	}
+	return "iptables"
+}
+
+// ensureIptablesRule adds an iptables/ip6tables DROP rule referencing this ipset if not already present.
+func (s *IPSet) ensureIptablesRule() {
+	fw := s.fwCmd()
+	if _, err := exec.LookPath(fw); err != nil {
+		if s.logger != nil {
+			s.logger.Debug(fw+" not found, skipping firewall rule")
+		}
+		return
+	}
+	// Check if rule already exists
+	ctx, cancel := context.WithTimeout(context.Background(), ipsetTimeout)
+	defer cancel()
+	if exec.CommandContext(ctx, fw, s.iptablesRuleArgs("-C")...).Run() == nil {
+		if s.logger != nil {
+			s.logger.Debug(fw+" rule already exists", zap.String("set", s.name))
+		}
+		return
+	}
+	// Add the rule
+	ctx2, cancel2 := context.WithTimeout(context.Background(), ipsetTimeout)
+	defer cancel2()
+	if err := exec.CommandContext(ctx2, fw, s.iptablesRuleArgs("-I")...).Run(); err != nil {
+		if s.logger != nil {
+			s.logger.Warn("failed to add "+fw+" rule", zap.String("set", s.name), zap.Error(err))
+		}
+		return
+	}
+	s.iptablesManaged = true
+	if s.logger != nil {
+		s.logger.Info(fw+" DROP rule added", zap.String("set", s.name))
+	}
+}
+
+// removeIptablesRule removes the iptables/ip6tables DROP rule if we added it.
+func (s *IPSet) removeIptablesRule() {
+	if !s.iptablesManaged {
+		return
+	}
+	fw := s.fwCmd()
+	ctx, cancel := context.WithTimeout(context.Background(), ipsetTimeout)
+	defer cancel()
+	if err := exec.CommandContext(ctx, fw, s.iptablesRuleArgs("-D")...).Run(); err != nil {
+		if s.logger != nil {
+			s.logger.Warn("failed to remove "+fw+" rule", zap.String("set", s.name), zap.Error(err))
+		}
+		return
+	}
+	s.iptablesManaged = false
+	if s.logger != nil {
+		s.logger.Info(fw+" DROP rule removed", zap.String("set", s.name))
+	}
+}
+
+// IPSetManager wraps a v4 and v6 IPSet pair, routing operations by address family.
+type IPSetManager struct {
+	v4 *IPSet
+	v6 *IPSet
+}
+
+// NewIPSetManager creates an IPSetManager with separate v4/v6 ipset instances.
+func NewIPSetManager(nameV4, nameV6 string, logger *zap.Logger) *IPSetManager {
+	return &IPSetManager{
+		v4: newIPSet(nameV4, false, logger),
+		v6: newIPSet(nameV6, true, logger),
+	}
+}
+
+// Available reports whether at least one of v4/v6 ipset can be used.
+func (m *IPSetManager) Available() bool {
+	return m.v4.Available() || m.v6.Available()
+}
+
+// Start launches background batch workers for both sets.
+func (m *IPSetManager) Start() {
+	m.v4.Start()
+	m.v6.Start()
+}
+
+// Stop shuts down both batch workers.
+func (m *IPSetManager) Stop() {
+	m.v4.Stop()
+	m.v6.Stop()
+}
+
+// Destruct implements caddy.Destructor for UsagePool ref-counting.
+func (m *IPSetManager) Destruct() error {
+	_ = m.v4.Destruct()
+	_ = m.v6.Destruct()
+	return nil
+}
+
+// route returns the appropriate IPSet for the given IP string.
+// IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) route to v4.
+func (m *IPSetManager) route(ip string) *IPSet {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return m.v4 // fallback; callers validate before reaching here
+	}
+	if parsed.To4() != nil {
+		return m.v4
+	}
+	return m.v6
+}
+
+// QueueAdd enqueues an IP for batched addition, routing to the correct set.
+func (m *IPSetManager) QueueAdd(ip string) {
+	m.route(ip).QueueAdd(ip)
+}
+
+// Add inserts an IP into the correct set.
+func (m *IPSetManager) Add(ip string) error {
+	return m.route(ip).Add(ip)
+}
+
+// Del removes an IP from the correct set.
+func (m *IPSetManager) Del(ip string) error {
+	return m.route(ip).Del(ip)
+}
+
+// AddBatch inserts multiple IPs, splitting them across v4/v6 sets.
+func (m *IPSetManager) AddBatch(ips []string) error {
+	var v4ips, v6ips []string
+	for _, ip := range ips {
+		parsed := net.ParseIP(ip)
+		if parsed == nil {
+			continue
+		}
+		if parsed.To4() != nil {
+			v4ips = append(v4ips, ip)
+		} else {
+			v6ips = append(v6ips, ip)
+		}
+	}
+	var firstErr error
+	if err := m.v4.AddBatch(v4ips); err != nil {
+		firstErr = err
+	}
+	if err := m.v6.AddBatch(v6ips); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
 }

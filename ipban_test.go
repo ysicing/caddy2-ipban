@@ -421,7 +421,7 @@ func newTestIPBan(t *testing.T) *IPBan {
 		ThresholdWindow: caddy.Duration(24 * time.Hour),
 		ruleMgr:         rm,
 		store:           store,
-		ipset:           NewIPSet("", nil),
+		ipset:           NewIPSetManager("", "", nil),
 		logger:          zap.NewNop(),
 	}
 }

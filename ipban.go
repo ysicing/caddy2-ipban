@@ -58,16 +58,18 @@ type IPBan struct {
 
 	ruleMgr      *RuleManager
 	store        *Store
-	ipset        *IPSet
+	ipset        *IPSetManager
 	logger       *zap.Logger
 	ruleKey      string // key for shared RuleManager pool
 	allowNets    []*net.IPNet
 	statusBodies [][]byte // pre-computed response bodies for block()
 }
 
-// defaultIPSetName is the fixed ipset name used for kernel-level blocking.
-// ipset is auto-detected — if the ipset CLI is available, it's used automatically.
+// defaultIPSetName is the fixed ipset name used for kernel-level IPv4 blocking.
 const defaultIPSetName = "ipban_blacklist_caddy2"
+
+// defaultIPSetNameV6 is the fixed ipset name used for kernel-level IPv6 blocking.
+const defaultIPSetNameV6 = "ipban_blacklist_caddy2_v6"
 
 // rulePool allows multiple sites with identical rule configs to share
 // a single RuleManager (one set of goroutines, one fsnotify watcher).
@@ -124,6 +126,10 @@ func (m *IPBan) Provision(ctx caddy.Context) error {
 	if isRemoteSource(m.RuleSource) {
 		urlStr = m.RuleSource
 		cacheDir = caddy.AppDataDir()
+		if strings.HasPrefix(m.RuleSource, "http://") {
+			m.logger.Warn("rule_source uses plain HTTP, consider HTTPS to prevent MITM attacks",
+				zap.String("url", m.RuleSource))
+		}
 	} else if m.RuleSource != "" {
 		filePath = m.RuleSource
 	}
@@ -145,7 +151,7 @@ func (m *IPBan) Provision(ctx caddy.Context) error {
 	// IPSet is shared via ipsetPool — one init, one batch worker, one ban restore.
 	logger := m.logger
 	ipsetVal, _, err := ipsetPool.LoadOrNew("ipset", func() (caddy.Destructor, error) {
-		s := NewIPSet(defaultIPSetName, logger)
+		s := NewIPSetManager(defaultIPSetName, defaultIPSetNameV6, logger)
 		s.Start()
 		return s, nil
 	})
@@ -153,7 +159,7 @@ func (m *IPBan) Provision(ctx caddy.Context) error {
 		_, _ = rulePool.Delete(m.ruleKey)
 		return fmt.Errorf("ipban: init ipset: %w", err)
 	}
-	m.ipset = ipsetVal.(*IPSet)
+	m.ipset = ipsetVal.(*IPSetManager)
 	setActiveIPSet(m.ipset)
 	if !m.ipset.Available() {
 		m.logger.Debug("ipset not available, using in-process blocking only")
@@ -207,7 +213,7 @@ func (m *IPBan) Provision(ctx caddy.Context) error {
 	m.logger.Info("ipban ready",
 		zap.String("rules", src),
 		zap.Bool("ipset", m.ipset.Available()),
-		zap.Bool("persist", m.store.filePath != ""))
+		zap.Bool("persist", m.store.HasPersistence()))
 	return nil
 }
 
@@ -234,13 +240,14 @@ func (m *IPBan) Validate() error {
 func (m *IPBan) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	ip := clientIP(r)
 
+	// Fast path: already banned — pure string map lookup, no allocation.
+	if m.store.IsBanned(ip) {
+		return m.block(w)
+	}
+
 	parsedIP := net.ParseIP(ip)
 	if parsedIP == nil || !isPublicIPParsed(parsedIP) || m.isAllowedParsed(parsedIP) {
 		return next.ServeHTTP(w, r)
-	}
-
-	if m.store.IsBanned(ip) {
-		return m.block(w)
 	}
 
 	ua := r.UserAgent()
@@ -360,14 +367,14 @@ func truncateField(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
-// sanitizeLogField removes control characters (< 0x20) to prevent log injection.
+// sanitizeLogField removes control characters (< 0x20 and DEL 0x7F) to prevent log injection.
 func sanitizeLogField(s string) string {
 	for i := 0; i < len(s); i++ {
-		if s[i] < 0x20 {
+		if s[i] < 0x20 || s[i] == 0x7F {
 			// Found a control char — do the full filter.
 			b := make([]byte, 0, len(s))
 			for j := 0; j < len(s); j++ {
-				if s[j] >= 0x20 {
+				if s[j] >= 0x20 && s[j] != 0x7F {
 					b = append(b, s[j])
 				}
 			}

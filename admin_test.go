@@ -209,3 +209,39 @@ func TestIPSetDel(t *testing.T) {
 		t.Fatal("expected error for invalid IP")
 	}
 }
+
+func TestIPSetManagerRouting(t *testing.T) {
+	m := NewIPSetManager("", "", nil)
+	// Both unavailable — operations should be no-ops.
+	if m.Available() {
+		t.Fatal("empty manager should not be available")
+	}
+	m.QueueAdd("1.2.3.4")
+	m.QueueAdd("2001:db8::1")
+	if err := m.Del("1.2.3.4"); err != nil {
+		t.Fatalf("Del on unavailable manager should be no-op, got: %v", err)
+	}
+	if err := m.AddBatch([]string{"1.2.3.4", "2001:db8::1"}); err != nil {
+		t.Fatalf("AddBatch on unavailable manager should be no-op, got: %v", err)
+	}
+}
+
+func TestIPSetManagerRouteV6(t *testing.T) {
+	m := NewIPSetManager("", "", nil)
+	// IPv4 routes to v4
+	if got := m.route("1.2.3.4"); got != m.v4 {
+		t.Error("IPv4 should route to v4")
+	}
+	// IPv6 routes to v6
+	if got := m.route("2001:db8::1"); got != m.v6 {
+		t.Error("IPv6 should route to v6")
+	}
+	// IPv4-mapped IPv6 routes to v4
+	if got := m.route("::ffff:1.2.3.4"); got != m.v4 {
+		t.Error("IPv4-mapped IPv6 should route to v4")
+	}
+	// Invalid IP falls back to v4
+	if got := m.route("not-an-ip"); got != m.v4 {
+		t.Error("invalid IP should fallback to v4")
+	}
+}

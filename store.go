@@ -207,6 +207,11 @@ func (s *Store) SetOnExpire(fn func(ip string)) {
 	s.mu.Unlock()
 }
 
+// HasPersistence reports whether the store is configured with file persistence.
+func (s *Store) HasPersistence() bool {
+	return s.filePath != ""
+}
+
 // Cleanup removes expired entries, syncs ipset removal, and persists the result.
 func (s *Store) Cleanup() {
 	s.mu.Lock()
@@ -315,7 +320,8 @@ func (s *Store) load() error {
 			continue
 		}
 		if net.ParseIP(r.IP) == nil {
-			continue // skip invalid IP records
+			s.logger.Warn("skipping invalid IP in persisted ban data", zap.String("ip", r.IP))
+			continue
 		}
 		s.records[r.IP] = r
 	}

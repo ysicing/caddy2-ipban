@@ -12,7 +12,7 @@ import (
 
 var (
 	activeStore    *Store
-	activeIPSet    *IPSet
+	activeIPSet    *IPSetManager
 	activeGlobalMu sync.RWMutex
 )
 
@@ -100,7 +100,7 @@ func getStore() *Store {
 	return activeStore
 }
 
-func getIPSet() *IPSet {
+func getIPSet() *IPSetManager {
 	activeGlobalMu.RLock()
 	defer activeGlobalMu.RUnlock()
 	return activeIPSet
@@ -112,7 +112,7 @@ func setActiveStore(s *Store) {
 	activeGlobalMu.Unlock()
 }
 
-func setActiveIPSet(ipset *IPSet) {
+func setActiveIPSet(ipset *IPSetManager) {
 	activeGlobalMu.Lock()
 	activeIPSet = ipset
 	activeGlobalMu.Unlock()
