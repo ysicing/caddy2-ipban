@@ -70,6 +70,9 @@ func compileRule(r Rule) (*compiledRule, error) {
 	}
 
 	for _, p := range r.PathRegex {
+		if len(p) > maxRegexLen {
+			return nil, fmt.Errorf("path_regex too long (%d > %d): %.40s...", len(p), maxRegexLen, p)
+		}
 		re, err := regexp.Compile("(?i)" + p)
 		if err != nil {
 			return nil, fmt.Errorf("invalid path_regex %q: %w", p, err)
@@ -77,6 +80,9 @@ func compileRule(r Rule) (*compiledRule, error) {
 		cr.pathRegex = append(cr.pathRegex, re)
 	}
 	for _, p := range r.UserAgentRegex {
+		if len(p) > maxRegexLen {
+			return nil, fmt.Errorf("user_agent_regex too long (%d > %d): %.40s...", len(p), maxRegexLen, p)
+		}
 		re, err := regexp.Compile("(?i)" + p)
 		if err != nil {
 			return nil, fmt.Errorf("invalid user_agent_regex %q: %w", p, err)
@@ -138,6 +144,9 @@ const maxRules = 1000
 
 // maxPatternsPerRule limits patterns within a single rule.
 const maxPatternsPerRule = 100
+
+// maxRegexLen limits the length of a single regex pattern to prevent CPU exhaustion.
+const maxRegexLen = 512
 
 func parseAndCompile(data []byte) ([]*compiledRule, error) {
 	var rf RuleFile

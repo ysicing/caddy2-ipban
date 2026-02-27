@@ -25,7 +25,7 @@ func init() {
 // Endpoints:
 //
 //	GET  /ipban/banned  — list all currently banned IPs
-//	POST /ipban/unban   — unban an IP: {"ip": "1.2.3.4"}
+//	POST /ipban/unban   — unban an IP: {"ip": "198.51.100.1"}
 type AdminAPI struct{}
 
 func (AdminAPI) CaddyModule() caddy.ModuleInfo {

@@ -106,9 +106,6 @@ func (s *IPSet) QueueAdd(ip string) {
 	if !s.available || s.banCh == nil || s.stopped.Load() {
 		return
 	}
-	if net.ParseIP(ip) == nil {
-		return
-	}
 	// Recover from send-on-closed-channel during the tiny window between
 	// stopped.Load() and close(banCh) in Stop().
 	defer func() { recover() }()
@@ -200,15 +197,25 @@ func (s *IPSet) Del(ip string) error {
 
 // AddBatch inserts multiple IPs in a single process.
 // No-op if unavailable or ips is empty.
-// All IPs are assumed pre-validated by callers (QueueAdd validates via net.ParseIP).
+// Invalid IPs are silently skipped as a defense-in-depth measure.
 func (s *IPSet) AddBatch(ips []string) error {
 	if !s.available || len(ips) == 0 {
+		return nil
+	}
+	// Filter out invalid IPs to prevent command injection.
+	valid := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		if net.ParseIP(ip) != nil {
+			valid = append(valid, ip)
+		}
+	}
+	if len(valid) == 0 {
 		return nil
 	}
 	if s.useNft {
 		family := s.nftFamily()
 		var buf strings.Builder
-		buf.Grow(60 + len(ips)*18)
+		buf.Grow(60 + len(valid)*18)
 		buf.WriteString("add element ")
 		buf.WriteString(family)
 		buf.WriteByte(' ')
@@ -216,7 +223,7 @@ func (s *IPSet) AddBatch(ips []string) error {
 		buf.WriteByte(' ')
 		buf.WriteString(s.name)
 		buf.WriteString(" { ")
-		for i, ip := range ips {
+		for i, ip := range valid {
 			if i > 0 {
 				buf.WriteString(", ")
 			}
@@ -230,7 +237,7 @@ func (s *IPSet) AddBatch(ips []string) error {
 		return cmd.Run()
 	}
 	var buf strings.Builder
-	for _, ip := range ips {
+	for _, ip := range valid {
 		buf.WriteString("add ")
 		buf.WriteString(s.name)
 		buf.WriteByte(' ')
@@ -361,7 +368,7 @@ func (s *IPSet) ensureIptablesRule() {
 	fw := s.fwCmd()
 	if _, err := exec.LookPath(fw); err != nil {
 		if s.logger != nil {
-			s.logger.Debug(fw+" not found, skipping firewall rule")
+			s.logger.Debug(fw + " not found, skipping firewall rule")
 		}
 		return
 	}
@@ -464,7 +471,8 @@ func (m *IPSetManager) Destruct() error {
 }
 
 // route returns the appropriate IPSet for the given IP string.
-// IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) route to v4.
+// IPv4 and IPv4-mapped IPv6 addresses (::ffff:x.x.x.x, 0:0:0:0:0:ffff:x.x.x.x, etc.) route to v4.
+// Uses net.ParseIP for correctness — this is not a hot path (only called on ban/unban).
 func (m *IPSetManager) route(ip string) *IPSet {
 	parsed := net.ParseIP(ip)
 	if parsed == nil {

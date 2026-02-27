@@ -2,7 +2,6 @@ package ipban
 
 import (
 	"strconv"
-	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -59,7 +58,7 @@ func (m *IPBan) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			m.BanDuration = caddy.Duration(dur)
 		case "allow":
 			for d.NextArg() {
-				m.Allowlist = append(m.Allowlist, strings.Fields(d.Val())...)
+				m.Allowlist = append(m.Allowlist, d.Val())
 			}
 			if len(m.Allowlist) == 0 {
 				return d.ArgErr()

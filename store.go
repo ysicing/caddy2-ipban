@@ -38,14 +38,14 @@ const maxBanEntries = 100000
 // Store manages banned IPs with optional file persistence.
 // Shared across sites via UsagePool — a malicious IP banned on one site is banned everywhere.
 type Store struct {
-	mu             sync.RWMutex
-	records        map[string]*BanRecord
-	filePath       string
-	saveTimer      *time.Timer
-	logger         *zap.Logger
-	cancel         context.CancelFunc
-	onExpire       func(ip string) // called outside lock when an expired IP is removed
-	saveGen        uint64          // incremented on each debounceSave; lets Cleanup invalidate pending callbacks
+	mu        sync.RWMutex
+	records   map[string]*BanRecord
+	filePath  string
+	saveTimer *time.Timer
+	logger    *zap.Logger
+	cancel    context.CancelFunc
+	onExpire  func(ip string) // called outside lock when an expired IP is removed
+	saveGen   uint64          // incremented on each debounceSave; lets Cleanup invalidate pending callbacks
 
 	hitsMu         sync.Mutex // independent lock for hits — avoids blocking IsBanned readers
 	hits           map[string]*hitRecord

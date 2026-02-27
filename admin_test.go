@@ -16,17 +16,17 @@ func TestStoreUnban(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.Ban("1.2.3.4", "test", "example.com", time.Hour)
-	if !s.IsBanned("1.2.3.4") {
+	s.Ban("198.51.100.1", "test", "example.com", time.Hour)
+	if !s.IsBanned("198.51.100.1") {
 		t.Fatal("expected IP to be banned")
 	}
-	if !s.Unban("1.2.3.4") {
+	if !s.Unban("198.51.100.1") {
 		t.Fatal("Unban should return true for banned IP")
 	}
-	if s.IsBanned("1.2.3.4") {
+	if s.IsBanned("198.51.100.1") {
 		t.Fatal("expected IP to be unbanned")
 	}
-	if s.Unban("1.2.3.4") {
+	if s.Unban("198.51.100.1") {
 		t.Fatal("Unban should return false for non-banned IP")
 	}
 }
@@ -36,13 +36,13 @@ func TestStoreUnbanClearsHits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.RecordHit("1.2.3.4", time.Hour)
-	s.RecordHit("1.2.3.4", time.Hour)
-	s.Ban("1.2.3.4", "test", "example.com", time.Hour)
-	s.Unban("1.2.3.4")
+	s.RecordHit("198.51.100.1", time.Hour)
+	s.RecordHit("198.51.100.1", time.Hour)
+	s.Ban("198.51.100.1", "test", "example.com", time.Hour)
+	s.Unban("198.51.100.1")
 
 	// After unban, hit counter should be cleared — next hit starts at 1.
-	count := s.RecordHit("1.2.3.4", time.Hour)
+	count := s.RecordHit("198.51.100.1", time.Hour)
 	if count != 1 {
 		t.Fatalf("expected hit count 1 after unban, got %d", count)
 	}
@@ -155,7 +155,7 @@ func TestAdminHandleUnbanValidation(t *testing.T) {
 		method string
 		body   string
 	}{
-		{"wrong method", http.MethodGet, `{"ip":"1.2.3.4"}`},
+		{"wrong method", http.MethodGet, `{"ip":"198.51.100.1"}`},
 		{"bad json", http.MethodPost, `not json`},
 		{"invalid ip", http.MethodPost, `{"ip":"not-an-ip"}`},
 	}
@@ -200,7 +200,7 @@ func TestAdminHandleListMethodNotAllowed(t *testing.T) {
 func TestIPSetDel(t *testing.T) {
 	// IPSet with no name — Del should be a no-op.
 	s := NewIPSet("", nil)
-	if err := s.Del("1.2.3.4"); err != nil {
+	if err := s.Del("198.51.100.1"); err != nil {
 		t.Fatalf("Del on unavailable ipset should be no-op, got: %v", err)
 	}
 	// Invalid IP should return error when available (can't test real ipset in CI).
@@ -216,12 +216,12 @@ func TestIPSetManagerRouting(t *testing.T) {
 	if m.Available() {
 		t.Fatal("empty manager should not be available")
 	}
-	m.QueueAdd("1.2.3.4")
+	m.QueueAdd("198.51.100.1")
 	m.QueueAdd("2001:db8::1")
-	if err := m.Del("1.2.3.4"); err != nil {
+	if err := m.Del("198.51.100.1"); err != nil {
 		t.Fatalf("Del on unavailable manager should be no-op, got: %v", err)
 	}
-	if err := m.AddBatch([]string{"1.2.3.4", "2001:db8::1"}); err != nil {
+	if err := m.AddBatch([]string{"198.51.100.1", "2001:db8::1"}); err != nil {
 		t.Fatalf("AddBatch on unavailable manager should be no-op, got: %v", err)
 	}
 }
@@ -229,7 +229,7 @@ func TestIPSetManagerRouting(t *testing.T) {
 func TestIPSetManagerRouteV6(t *testing.T) {
 	m := NewIPSetManager("", "", nil)
 	// IPv4 routes to v4
-	if got := m.route("1.2.3.4"); got != m.v4 {
+	if got := m.route("198.51.100.1"); got != m.v4 {
 		t.Error("IPv4 should route to v4")
 	}
 	// IPv6 routes to v6
@@ -237,7 +237,7 @@ func TestIPSetManagerRouteV6(t *testing.T) {
 		t.Error("IPv6 should route to v6")
 	}
 	// IPv4-mapped IPv6 routes to v4
-	if got := m.route("::ffff:1.2.3.4"); got != m.v4 {
+	if got := m.route("::ffff:198.51.100.1"); got != m.v4 {
 		t.Error("IPv4-mapped IPv6 should route to v4")
 	}
 	// Invalid IP falls back to v4

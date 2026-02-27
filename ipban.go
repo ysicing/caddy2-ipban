@@ -102,7 +102,7 @@ func (m *IPBan) Provision(ctx caddy.Context) error {
 	for i, code := range m.StatusCodes {
 		m.statusBodies[i] = []byte(http.StatusText(code))
 	}
-	if m.Threshold <= 0 {
+	if m.Threshold == 0 {
 		m.Threshold = 3
 	}
 	if time.Duration(m.ThresholdWindow) == 0 {
@@ -233,6 +233,9 @@ func (m *IPBan) Validate() error {
 	if time.Duration(m.RefreshInterval) < 0 {
 		return fmt.Errorf("ipban: refresh_interval cannot be negative")
 	}
+	if m.Threshold < 0 {
+		return fmt.Errorf("ipban: threshold cannot be negative")
+	}
 	return nil
 }
 
@@ -241,8 +244,20 @@ func (m *IPBan) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp
 	ip := clientIP(r)
 
 	// Fast path: already banned — pure string map lookup, no allocation.
+	// Check allowlist only when configured: a persisted ban may conflict with a later allowlist change.
 	if m.store.IsBanned(ip) {
-		return m.block(w)
+		if len(m.allowNets) > 0 {
+			if parsed := net.ParseIP(ip); parsed != nil && m.isAllowedParsed(parsed) {
+				m.store.Unban(ip)
+				_ = m.ipset.Del(ip)
+				m.logger.Debug("unbanned allowlisted IP", zap.String("ip", ip))
+				// fall through to normal request processing
+			} else {
+				return m.block(w)
+			}
+		} else {
+			return m.block(w)
+		}
 	}
 
 	parsedIP := net.ParseIP(ip)
@@ -294,7 +309,10 @@ func (m *IPBan) ban(ip, reason, host string) bool {
 }
 
 func (m *IPBan) block(w http.ResponseWriter) error {
-	idx := rand.IntN(len(m.StatusCodes))
+	idx := 0
+	if len(m.StatusCodes) > 1 {
+		idx = rand.IntN(len(m.StatusCodes))
+	}
 	w.WriteHeader(m.StatusCodes[idx])
 	_, _ = w.Write(m.statusBodies[idx])
 	return nil

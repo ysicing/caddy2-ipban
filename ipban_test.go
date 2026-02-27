@@ -222,20 +222,20 @@ func TestRuleManagerCacheFallback(t *testing.T) {
 func TestStore(t *testing.T) {
 	t.Run("ban and check", func(t *testing.T) {
 		s, _ := NewStore("", nil)
-		if s.IsBanned("1.2.3.4") {
+		if s.IsBanned("198.51.100.1") {
 			t.Error("should not be banned initially")
 		}
-		s.Ban("1.2.3.4", "test", "", 0)
-		if !s.IsBanned("1.2.3.4") {
+		s.Ban("198.51.100.1", "test", "", 0)
+		if !s.IsBanned("198.51.100.1") {
 			t.Error("should be banned after Ban()")
 		}
 	})
 
 	t.Run("ban with expiry", func(t *testing.T) {
 		s, _ := NewStore("", nil)
-		s.Ban("1.2.3.4", "test", "", 1*time.Millisecond)
+		s.Ban("198.51.100.1", "test", "", 1*time.Millisecond)
 		time.Sleep(5 * time.Millisecond)
-		if s.IsBanned("1.2.3.4") {
+		if s.IsBanned("198.51.100.1") {
 			t.Error("should have expired")
 		}
 	})
@@ -267,7 +267,7 @@ func TestClientIP(t *testing.T) {
 	}{
 		{"remote only", "192.168.1.1:1234", "", "192.168.1.1"},
 		{"remote no port", "192.168.1.1", "", "192.168.1.1"},
-		{"caddy client_ip", "10.0.0.1:80", "1.2.3.4", "1.2.3.4"},
+		{"caddy client_ip", "10.0.0.1:80", "198.51.100.1", "198.51.100.1"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -315,7 +315,7 @@ func TestIsPublicIP(t *testing.T) {
 
 func TestAllowlist(t *testing.T) {
 	m := newTestIPBan(t)
-	m.Allowlist = []string{"8.8.8.0/24", "1.2.3.4"}
+	m.Allowlist = []string{"8.8.8.0/24", "198.51.100.1"}
 	nets, err := parseAllowlist(m.Allowlist)
 	if err != nil {
 		t.Fatal(err)
@@ -325,8 +325,8 @@ func TestAllowlist(t *testing.T) {
 	if !m.isAllowedParsed(net.ParseIP("8.8.8.1")) {
 		t.Error("8.8.8.1 should be allowed (in 8.8.8.0/24)")
 	}
-	if !m.isAllowedParsed(net.ParseIP("1.2.3.4")) {
-		t.Error("1.2.3.4 should be allowed (exact match)")
+	if !m.isAllowedParsed(net.ParseIP("198.51.100.1")) {
+		t.Error("198.51.100.1 should be allowed (exact match)")
 	}
 	if m.isAllowedParsed(net.ParseIP("9.9.9.9")) {
 		t.Error("9.9.9.9 should not be allowed")
@@ -391,18 +391,18 @@ func TestThreshold(t *testing.T) {
 func TestStoreRecordHit(t *testing.T) {
 	s, _ := NewStore("", nil)
 
-	if c := s.RecordHit("1.2.3.4", time.Hour); c != 1 {
+	if c := s.RecordHit("198.51.100.1", time.Hour); c != 1 {
 		t.Errorf("first hit = %d, want 1", c)
 	}
-	if c := s.RecordHit("1.2.3.4", time.Hour); c != 2 {
+	if c := s.RecordHit("198.51.100.1", time.Hour); c != 2 {
 		t.Errorf("second hit = %d, want 2", c)
 	}
 
 	// Window expiry
 	s2, _ := NewStore("", nil)
-	s2.RecordHit("1.2.3.4", 1*time.Millisecond)
+	s2.RecordHit("198.51.100.1", 1*time.Millisecond)
 	time.Sleep(5 * time.Millisecond)
-	if c := s2.RecordHit("1.2.3.4", 1*time.Millisecond); c != 1 {
+	if c := s2.RecordHit("198.51.100.1", 1*time.Millisecond); c != 1 {
 		t.Errorf("after window expiry = %d, want 1", c)
 	}
 }
@@ -416,7 +416,7 @@ func newTestIPBan(t *testing.T) *IPBan {
 	store, _ := NewStore("", nil)
 	return &IPBan{
 		StatusCodes:     []int{403},
-		statusBodies:    [][]byte{[]byte(http.StatusText(403))},
+		statusBodies:    [][]byte{[]byte(http.StatusText(http.StatusForbidden))},
 		Threshold:       1,
 		ThresholdWindow: caddy.Duration(24 * time.Hour),
 		ruleMgr:         rm,
@@ -433,7 +433,7 @@ func TestServeHTTP_BlocksMaliciousPath(t *testing.T) {
 		return nil
 	})
 	r := httptest.NewRequest("GET", "/.env", nil)
-	r.RemoteAddr = "1.2.3.4:5678"
+	r.RemoteAddr = "198.51.100.1:5678"
 	w := httptest.NewRecorder()
 	_ = m.ServeHTTP(w, r, next)
 	if w.Code != 403 {
@@ -448,7 +448,7 @@ func TestServeHTTP_AllowsNormalRequest(t *testing.T) {
 		return nil
 	})
 	r := httptest.NewRequest("GET", "/index.html", nil)
-	r.RemoteAddr = "1.2.3.4:5678"
+	r.RemoteAddr = "198.51.100.1:5678"
 	w := httptest.NewRecorder()
 	_ = m.ServeHTTP(w, r, next)
 	if w.Code != 200 {
@@ -458,14 +458,14 @@ func TestServeHTTP_AllowsNormalRequest(t *testing.T) {
 
 func TestServeHTTP_BlocksBannedIP(t *testing.T) {
 	m := newTestIPBan(t)
-	m.store.Ban("1.2.3.4", "test", "", 0)
+	m.store.Ban("198.51.100.1", "test", "", 0)
 
 	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
 		w.WriteHeader(200)
 		return nil
 	})
 	r := httptest.NewRequest("GET", "/anything", nil)
-	r.RemoteAddr = "1.2.3.4:5678"
+	r.RemoteAddr = "198.51.100.1:5678"
 	w := httptest.NewRecorder()
 	_ = m.ServeHTTP(w, r, next)
 	if w.Code != 403 {
