@@ -55,7 +55,8 @@ func (m *IPBan) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if err != nil {
 				return d.Errf("invalid ban_duration: %s", d.Val())
 			}
-			m.BanDuration = caddy.Duration(dur)
+			d := caddy.Duration(dur)
+			m.BanDuration = &d
 		case "allow":
 			for d.NextArg() {
 				m.Allowlist = append(m.Allowlist, d.Val())
@@ -63,24 +64,6 @@ func (m *IPBan) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if len(m.Allowlist) == 0 {
 				return d.ArgErr()
 			}
-		case "threshold":
-			if !d.NextArg() {
-				return d.ArgErr()
-			}
-			n, err := strconv.Atoi(d.Val())
-			if err != nil || n < 1 {
-				return d.Errf("invalid threshold: %s", d.Val())
-			}
-			m.Threshold = n
-		case "threshold_window":
-			if !d.NextArg() {
-				return d.ArgErr()
-			}
-			dur, err := caddy.ParseDuration(d.Val())
-			if err != nil {
-				return d.Errf("invalid threshold_window: %s", d.Val())
-			}
-			m.ThresholdWindow = caddy.Duration(dur)
 		default:
 			return d.Errf("unknown option: %s", d.Val())
 		}

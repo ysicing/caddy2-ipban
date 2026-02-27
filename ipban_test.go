@@ -349,64 +349,6 @@ func TestServeHTTP_SkipsPrivateIP(t *testing.T) {
 	}
 }
 
-func TestThreshold(t *testing.T) {
-	m := newTestIPBan(t)
-	m.Threshold = 3
-	m.ThresholdWindow = caddy.Duration(1 * time.Hour)
-
-	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
-		w.WriteHeader(200)
-		return nil
-	})
-
-	ip := "203.0.113.1" // public IP from TEST-NET-3
-
-	// First two hits should block but NOT ban
-	for i := 0; i < 2; i++ {
-		r := httptest.NewRequest("GET", "/.env", nil)
-		r.RemoteAddr = ip + ":5678"
-		w := httptest.NewRecorder()
-		_ = m.ServeHTTP(w, r, next)
-		if w.Code != 403 {
-			t.Errorf("hit %d: expected 403, got %d", i+1, w.Code)
-		}
-		if m.store.IsBanned(ip) {
-			t.Errorf("hit %d: should NOT be banned yet", i+1)
-		}
-	}
-
-	// Third hit should trigger the ban
-	r := httptest.NewRequest("GET", "/.env", nil)
-	r.RemoteAddr = ip + ":5678"
-	w := httptest.NewRecorder()
-	_ = m.ServeHTTP(w, r, next)
-	if w.Code != 403 {
-		t.Errorf("hit 3: expected 403, got %d", w.Code)
-	}
-	if !m.store.IsBanned(ip) {
-		t.Error("hit 3: should be banned now")
-	}
-}
-
-func TestStoreRecordHit(t *testing.T) {
-	s, _ := NewStore("", nil)
-
-	if c := s.RecordHit("198.51.100.1", time.Hour); c != 1 {
-		t.Errorf("first hit = %d, want 1", c)
-	}
-	if c := s.RecordHit("198.51.100.1", time.Hour); c != 2 {
-		t.Errorf("second hit = %d, want 2", c)
-	}
-
-	// Window expiry
-	s2, _ := NewStore("", nil)
-	s2.RecordHit("198.51.100.1", 1*time.Millisecond)
-	time.Sleep(5 * time.Millisecond)
-	if c := s2.RecordHit("198.51.100.1", 1*time.Millisecond); c != 1 {
-		t.Errorf("after window expiry = %d, want 1", c)
-	}
-}
-
 func newTestIPBan(t *testing.T) *IPBan {
 	t.Helper()
 	rm, err := NewRuleManager("", "", "", time.Hour, zap.NewNop())
@@ -414,15 +356,15 @@ func newTestIPBan(t *testing.T) *IPBan {
 		t.Fatal(err)
 	}
 	store, _ := NewStore("", nil)
+	banDur := caddy.Duration(24 * time.Hour)
 	return &IPBan{
-		StatusCodes:     []int{403},
-		statusBodies:    [][]byte{[]byte(http.StatusText(http.StatusForbidden))},
-		Threshold:       1,
-		ThresholdWindow: caddy.Duration(24 * time.Hour),
-		ruleMgr:         rm,
-		store:           store,
-		ipset:           NewIPSetManager("", "", nil),
-		logger:          zap.NewNop(),
+		StatusCodes:  []int{403},
+		statusBodies: [][]byte{[]byte(http.StatusText(http.StatusForbidden))},
+		BanDuration:  &banDur,
+		ruleMgr:      rm,
+		store:        store,
+		ipset:        NewIPSetManager("", "", nil),
+		logger:       zap.NewNop(),
 	}
 }
 
@@ -502,8 +444,7 @@ func TestValidate(t *testing.T) {
 		{"valid", IPBan{StatusCodes: []int{403}}, false},
 		{"empty status codes ok after provision", IPBan{}, false},
 		{"non-4xx code", IPBan{StatusCodes: []int{500}}, true},
-		{"negative ban_duration", IPBan{StatusCodes: []int{403}, BanDuration: caddy.Duration(-time.Hour)}, true},
-		{"negative threshold_window", IPBan{StatusCodes: []int{403}, ThresholdWindow: caddy.Duration(-time.Hour)}, true},
+		{"negative ban_duration", IPBan{StatusCodes: []int{403}, BanDuration: func() *caddy.Duration { d := caddy.Duration(-time.Hour); return &d }()}, true},
 		{"negative refresh_interval", IPBan{StatusCodes: []int{403}, RefreshInterval: caddy.Duration(-time.Hour)}, true},
 	}
 	for _, tt := range tests {
@@ -529,17 +470,6 @@ func TestStoreMaxBanEntries(t *testing.T) {
 	}
 	if !s.Ban("10.0.0.0", "updated", "", 0) {
 		t.Error("Re-banning existing IP should succeed even when full")
-	}
-}
-
-func TestStoreMaxHitEntries(t *testing.T) {
-	s, _ := NewStore("", nil)
-	for i := 0; i < maxHitEntries; i++ {
-		ip := fmt.Sprintf("10.%d.%d.%d", (i>>16)&0xff, (i>>8)&0xff, i&0xff)
-		s.RecordHit(ip, time.Hour)
-	}
-	if c := s.RecordHit("99.99.99.99", time.Hour); c != 0 {
-		t.Errorf("RecordHit should return 0 when full, got %d", c)
 	}
 }
 

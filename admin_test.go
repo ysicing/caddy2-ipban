@@ -31,23 +31,6 @@ func TestStoreUnban(t *testing.T) {
 	}
 }
 
-func TestStoreUnbanClearsHits(t *testing.T) {
-	s, err := NewStore("", zap.NewNop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.RecordHit("198.51.100.1", time.Hour)
-	s.RecordHit("198.51.100.1", time.Hour)
-	s.Ban("198.51.100.1", "test", "example.com", time.Hour)
-	s.Unban("198.51.100.1")
-
-	// After unban, hit counter should be cleared — next hit starts at 1.
-	count := s.RecordHit("198.51.100.1", time.Hour)
-	if count != 1 {
-		t.Fatalf("expected hit count 1 after unban, got %d", count)
-	}
-}
-
 func TestStoreListBanned(t *testing.T) {
 	s, err := NewStore("", zap.NewNop())
 	if err != nil {
@@ -246,53 +229,17 @@ func TestIPSetManagerRouteV6(t *testing.T) {
 	}
 }
 
-func TestIPSetNftHelpers(t *testing.T) {
-	tests := []struct {
-		ipv6     bool
-		family   string
-		addrType string
-		saddr    string
-	}{
-		{false, "ip", "ipv4_addr", "ip saddr"},
-		{true, "ip6", "ipv6_addr", "ip6 saddr"},
-	}
-	for _, tt := range tests {
-		s := &IPSet{ipv6: tt.ipv6}
-		if got := s.nftFamily(); got != tt.family {
-			t.Errorf("nftFamily(ipv6=%v): got %q, want %q", tt.ipv6, got, tt.family)
-		}
-		if got := s.nftAddrType(); got != tt.addrType {
-			t.Errorf("nftAddrType(ipv6=%v): got %q, want %q", tt.ipv6, got, tt.addrType)
-		}
-		if got := s.nftSaddr(); got != tt.saddr {
-			t.Errorf("nftSaddr(ipv6=%v): got %q, want %q", tt.ipv6, got, tt.saddr)
-		}
-	}
-}
-
 func TestIPSetInitFallback(t *testing.T) {
-	// On macOS/CI where neither nft nor ipset is available,
-	// init should return false and available should be false.
+	// On macOS/CI where ipset is unavailable, init should return false.
 	s := NewIPSet("test_fallback", nil)
 	if s.Available() {
-		t.Skip("nft or ipset is available on this system, skipping fallback test")
-	}
-	if s.useNft {
-		t.Error("useNft should be false when nft is unavailable")
+		t.Skip("ipset is available on this system, skipping fallback test")
 	}
 }
 
-func TestIPSetDestructNftPath(t *testing.T) {
-	// Destruct with useNft=true but available=false should not panic.
-	s := &IPSet{name: "test", useNft: true, available: false}
-	if err := s.Destruct(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestIPSetDestructIpsetPath(t *testing.T) {
-	// Destruct with useNft=false and available=false should not panic.
-	s := &IPSet{name: "test", useNft: false, available: false}
+func TestIPSetDestructNoOp(t *testing.T) {
+	// Destruct with available=false should not panic.
+	s := &IPSet{name: "test", available: false}
 	if err := s.Destruct(); err != nil {
 		t.Fatal(err)
 	}

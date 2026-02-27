@@ -21,17 +21,6 @@ type BanRecord struct {
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
-// hitRecord tracks malicious request counts for threshold-based banning.
-type hitRecord struct {
-	count    int
-	firstHit time.Time
-	window   time.Duration
-}
-
-// maxHitEntries limits the hits map size to prevent memory exhaustion
-// from distributed scanning attacks using many unique source IPs.
-const maxHitEntries = 100000
-
 // maxBanEntries limits the records map size to prevent unbounded memory growth.
 const maxBanEntries = 100000
 
@@ -46,10 +35,6 @@ type Store struct {
 	cancel    context.CancelFunc
 	onExpire  func(ip string) // called outside lock when an expired IP is removed
 	saveGen   uint64          // incremented on each debounceSave; lets Cleanup invalidate pending callbacks
-
-	hitsMu         sync.Mutex // independent lock for hits — avoids blocking IsBanned readers
-	hits           map[string]*hitRecord
-	hitsFullLogged bool // log once when hits map is full
 }
 
 // NewStore creates a store, loading persisted data if filePath is set.
@@ -59,7 +44,6 @@ func NewStore(filePath string, logger *zap.Logger) (*Store, error) {
 	}
 	s := &Store{
 		records:  make(map[string]*BanRecord),
-		hits:     make(map[string]*hitRecord),
 		filePath: filePath,
 		logger:   logger,
 	}
@@ -107,7 +91,7 @@ func (s *Store) Ban(ip, reason, host string, duration time.Duration) bool {
 	return true
 }
 
-// Unban removes an IP from the ban list and clears its hit counter.
+// Unban removes an IP from the ban list.
 // Returns true if the IP was actually banned.
 func (s *Store) Unban(ip string) bool {
 	s.mu.Lock()
@@ -117,10 +101,6 @@ func (s *Store) Unban(ip string) bool {
 		s.debounceSave()
 	}
 	s.mu.Unlock()
-
-	s.hitsMu.Lock()
-	delete(s.hits, ip)
-	s.hitsMu.Unlock()
 	return ok
 }
 
@@ -166,40 +146,6 @@ func (s *Store) debounceSave() {
 	})
 }
 
-// RecordHit increments the hit counter for an IP within a sliding window.
-// Returns the current count. If the window has elapsed, the counter resets.
-func (s *Store) RecordHit(ip string, window time.Duration) int {
-	s.hitsMu.Lock()
-	defer s.hitsMu.Unlock()
-
-	now := time.Now()
-	h, ok := s.hits[ip]
-	if !ok || now.Sub(h.firstHit) > h.window {
-		// Prevent unbounded growth from distributed scanning attacks.
-		// Don't purge inline — that's O(N) under lock on the hot path.
-		// The background Cleanup() goroutine handles expired entry removal.
-		if !ok && len(s.hits) >= maxHitEntries {
-			if !s.hitsFullLogged {
-				s.logger.Warn("hit tracking table full, new IPs will not be tracked",
-					zap.Int("limit", maxHitEntries))
-				s.hitsFullLogged = true
-			}
-			return 0
-		}
-		s.hits[ip] = &hitRecord{count: 1, firstHit: now, window: window}
-		return 1
-	}
-	h.count++
-	return h.count
-}
-
-// ClearHits removes the hit counter for an IP (called after banning).
-func (s *Store) ClearHits(ip string) {
-	s.hitsMu.Lock()
-	delete(s.hits, ip)
-	s.hitsMu.Unlock()
-}
-
 // SetOnExpire registers a callback invoked (outside the lock) when an expired IP is removed.
 func (s *Store) SetOnExpire(fn func(ip string)) {
 	s.mu.Lock()
@@ -232,18 +178,6 @@ func (s *Store) Cleanup() {
 	}
 	onExpire := s.onExpire
 	s.mu.Unlock()
-
-	// Clean up expired hits under separate lock.
-	s.hitsMu.Lock()
-	for ip, h := range s.hits {
-		if now.Sub(h.firstHit) > h.window {
-			delete(s.hits, ip)
-		}
-	}
-	if s.hitsFullLogged && len(s.hits) < maxHitEntries {
-		s.hitsFullLogged = false
-	}
-	s.hitsMu.Unlock()
 
 	// Remove expired IPs from ipset outside the lock.
 	for _, ip := range expiredIPs {

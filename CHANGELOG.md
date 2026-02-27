@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-02-27
+
+### Added
+- Default ban duration of 7 days (previously 0 = permanent with no default)
+
+### Changed
+- Request matching now immediately bans on first hit; threshold and time window removed
+- `BanDuration` field changed to pointer type to distinguish "not set" from zero value
+- `ipset.go` simplified to pure ipset backend only; nft/iptables code removed
+- `IPSet.Destruct()` no longer manages firewall rules cleanup
+
+### Removed
+- `Threshold` and `ThresholdWindow` configuration options
+- `threshold` and `threshold_window` Caddyfile directives
+- `Store.RecordHit()` and `Store.ClearHits()` methods
+- `hitRecord` struct and `hitsMu`/`hits`/`hitsFullLogged` fields from `Store`
+- `maxHitEntries` constant
+- nftables backend: `initNft()`, `removeNftTable()`, `nftElementCmd()`, `nftFamily()`, `nftAddrType()`, `nftSaddr()`
+- iptables backend: `iptablesRuleArgs()`, `fwCmd()`, `ensureIptablesRule()`, `removeIptablesRule()`
+- `useNft` and `iptablesManaged` fields from `IPSet` struct
+
+### Security
+- Removed `maxHitEntries` memory limit (no longer needed without hit tracking)
+
 ## [1.1.0] - 2026-02-27
 
 ### Added

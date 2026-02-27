@@ -47,14 +47,10 @@ type IPBan struct {
 	RefreshInterval caddy.Duration `json:"refresh_interval,omitempty"`
 	// StatusCodes to randomly return. Default: [451].
 	StatusCodes []int `json:"status_codes,omitempty"`
-	// BanDuration is how long an IP stays banned. 0 = permanent.
-	BanDuration caddy.Duration `json:"ban_duration,omitempty"`
+	// BanDuration is how long an IP stays banned. Default: 7 days. 0 = permanent.
+	BanDuration *caddy.Duration `json:"ban_duration,omitempty"`
 	// Allowlist is a list of IPs or CIDRs that are never banned.
 	Allowlist []string `json:"allowlist,omitempty"`
-	// Threshold is the number of malicious hits before banning. Default: 3.
-	Threshold int `json:"threshold,omitempty"`
-	// ThresholdWindow is the time window for counting hits. Default: 24h.
-	ThresholdWindow caddy.Duration `json:"threshold_window,omitempty"`
 
 	ruleMgr      *RuleManager
 	store        *Store
@@ -102,11 +98,9 @@ func (m *IPBan) Provision(ctx caddy.Context) error {
 	for i, code := range m.StatusCodes {
 		m.statusBodies[i] = []byte(http.StatusText(code))
 	}
-	if m.Threshold == 0 {
-		m.Threshold = 3
-	}
-	if time.Duration(m.ThresholdWindow) == 0 {
-		m.ThresholdWindow = caddy.Duration(24 * time.Hour)
+	if m.BanDuration == nil {
+		d := caddy.Duration(7 * 24 * time.Hour)
+		m.BanDuration = &d
 	}
 
 	nets, err := parseAllowlist(m.Allowlist)
@@ -224,17 +218,11 @@ func (m *IPBan) Validate() error {
 			return fmt.Errorf("ipban: status code %d is not a 4xx code", code)
 		}
 	}
-	if time.Duration(m.BanDuration) < 0 {
+	if m.BanDuration != nil && time.Duration(*m.BanDuration) < 0 {
 		return fmt.Errorf("ipban: ban_duration cannot be negative")
-	}
-	if time.Duration(m.ThresholdWindow) < 0 {
-		return fmt.Errorf("ipban: threshold_window cannot be negative")
 	}
 	if time.Duration(m.RefreshInterval) < 0 {
 		return fmt.Errorf("ipban: refresh_interval cannot be negative")
-	}
-	if m.Threshold < 0 {
-		return fmt.Errorf("ipban: threshold cannot be negative")
 	}
 	return nil
 }
@@ -267,15 +255,9 @@ func (m *IPBan) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp
 
 	ua := r.UserAgent()
 	if m.ruleMgr.Match(r.URL.Path, ua) {
-		window := time.Duration(m.ThresholdWindow)
-		count := m.store.RecordHit(ip, window)
-		if count >= m.Threshold {
-			reason := truncatedReason(r.URL.Path, ua)
-			host := sanitizeLogField(truncateField(r.Host, 256))
-			if m.ban(ip, reason, host) {
-				m.store.ClearHits(ip)
-			}
-		}
+		reason := truncatedReason(r.URL.Path, ua)
+		host := sanitizeLogField(truncateField(r.Host, 256))
+		m.ban(ip, reason, host)
 		return m.block(w)
 	}
 
@@ -299,7 +281,7 @@ func (m *IPBan) Cleanup() error {
 }
 
 func (m *IPBan) ban(ip, reason, host string) bool {
-	dur := time.Duration(m.BanDuration)
+	dur := time.Duration(*m.BanDuration)
 	if !m.store.Ban(ip, reason, host, dur) {
 		return false
 	}
